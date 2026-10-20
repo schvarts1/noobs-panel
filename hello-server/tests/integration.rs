@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 struct Server {
     child: Child,
     port: u16,
+    /// Keeps the stdout pipe open.
+    ///
+    /// If the read end of the pipe were closed, the next write by the
+    /// server would raise SIGPIPE and kill it, which made the tests flaky.
+    _stdout: std::thread::JoinHandle<String>,
+    /// Ports that are held busy for the whole test.
+    _blockers: Vec<TcpListener>,
 }
 
 /// Base ports used by the tests.
@@ -21,8 +28,10 @@ const PORTS: [u16; 6] = [18080, 18090, 18100, 18110, 18120, 18130];
 impl Server {
     /// Start the binary and wait until it reports the port it listens on.
     fn start(args: &[&str], occupy: &[u16]) -> Server {
-        // Occupy the requested ports so the fallback path is exercised.
-        let _blockers: Vec<TcpListener> = occupy
+        // Occupy the requested ports so the fallback path is exercised. The
+        // blockers are held for the whole life of the test, because the
+        // server has to find them busy when it binds.
+        let blockers: Vec<TcpListener> = occupy
             .iter()
             .map(|&port| {
                 TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).unwrap()
@@ -53,9 +62,19 @@ impl Server {
             line.clear();
         }
 
+        // Keep draining the output in the background so the pipe stays open
+        // and the server never blocks on a full pipe buffer.
+        let pump = std::thread::spawn(move || {
+            let mut collected = String::new();
+            let _ = reader.read_to_string(&mut collected);
+            collected
+        });
+
         Server {
             child,
             port: port.expect("server did not report a port"),
+            _stdout: pump,
+            _blockers: blockers,
         }
     }
 

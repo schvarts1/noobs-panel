@@ -1,10 +1,9 @@
 [package]
 name = "hello-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A tiny Hello World web server, used as the workload that panel instances run."
 
 [dependencies]
 tiny_http = "0.12.0"
-
-[profile.release]
-opt-level = 2
