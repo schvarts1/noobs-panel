@@ -4,3 +4,6 @@ target/
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# The file the benchmarker writes when the disk limit is tested
+disk-test.bin

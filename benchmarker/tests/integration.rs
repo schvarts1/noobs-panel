@@ -18,6 +18,8 @@ const DISK_MB: u64 = 64;
 struct Server {
     child: Child,
     port: u16,
+    /// The directory the server was started in.
+    directory: std::path::PathBuf,
     /// Keeps the output pipe open.
     ///
     /// If the read end of the pipe were closed, the next write by the
@@ -34,12 +36,18 @@ impl Server {
         let _blocker =
             TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).unwrap();
 
+        // The server writes its test file in the working directory, so it
+        // gets one of its own and leaves nothing behind in the repository.
+        let directory = std::env::temp_dir().join(format!("benchmarker-test-{port}"));
+        std::fs::create_dir_all(&directory).unwrap();
+
         let mut command = Command::new(env!("CARGO_BIN_EXE_benchmarker"));
         command
             .arg("--port")
             .arg(port.to_string())
             .arg("--host")
             .arg("127.0.0.1")
+            .current_dir(&directory)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // SAFETY: the limits are set before the process does anything else,
@@ -78,6 +86,7 @@ impl Server {
         Server {
             child,
             port: port.expect("the benchmarker did not report a port"),
+            directory,
             _stdout: pump,
         }
     }
@@ -103,6 +112,8 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The directory with the test file is removed again.
+        let _ = std::fs::remove_dir_all(self.directory.clone());
     }
 }
 
