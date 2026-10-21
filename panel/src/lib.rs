@@ -6,5 +6,6 @@ pub mod config;
 pub mod db;
 pub mod instances;
 pub mod models;
+pub mod presets;
 pub mod views;
 pub mod web;

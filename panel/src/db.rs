@@ -5,6 +5,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{Instance, InstanceState, Role, User};
+use crate::presets::Preset;
 
 /// Errors coming out of the storage layer.
 #[derive(Debug)]
@@ -118,6 +119,26 @@ impl Database {
             CREATE INDEX IF NOT EXISTS instances_owner ON instances(owner_id);
             "#,
         )?;
+
+        // The tables above are only made when they are not there yet, so a
+        // table from an earlier version is brought up to date by hand.
+        self.add_column_if_missing("instances", "preset", "TEXT NOT NULL DEFAULT 'hello-world'")?;
+
+        Ok(())
+    }
+
+    /// Add a column to a table, unless the table already has it.
+    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let found = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if found == 0 {
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
         Ok(())
     }
 
@@ -352,6 +373,7 @@ impl Database {
 
     /// Create an instance record.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_instance(
         &self,
         name: &str,
@@ -360,12 +382,14 @@ impl Database {
         memory_limit_mb: i64,
         cpu_limit_seconds: i64,
         disk_limit_mb: i64,
+        preset: &str,
         created_at: i64,
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO instances
-                 (name, owner_id, port, state, memory_limit_mb, cpu_limit_seconds, disk_limit_mb, created_at)
-             VALUES (?1, ?2, ?3, 'stopped', ?4, ?5, ?6, ?7)",
+                 (name, owner_id, port, state, memory_limit_mb, cpu_limit_seconds,
+                  disk_limit_mb, preset, created_at)
+             VALUES (?1, ?2, ?3, 'stopped', ?4, ?5, ?6, ?7, ?8)",
             params![
                 name,
                 owner_id,
@@ -373,10 +397,20 @@ impl Database {
                 memory_limit_mb,
                 cpu_limit_seconds,
                 disk_limit_mb,
+                preset,
                 created_at
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Hand an instance to another account.
+    pub fn set_instance_owner(&self, id: i64, owner_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET owner_id = ?1 WHERE id = ?2",
+            params![owner_id, id],
+        )?;
+        Ok(())
     }
 
     /// Look up an instance by id.
@@ -386,7 +420,7 @@ impl Database {
             .query_row(
                 "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
                         i.memory_limit_mb, i.cpu_limit_seconds, i.disk_limit_mb,
-                        i.created_at, i.exit_code
+                        i.created_at, i.exit_code, i.preset
                  FROM instances i JOIN users u ON u.id = i.owner_id
                  WHERE i.id = ?1",
                 params![id],
@@ -401,7 +435,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
                     i.memory_limit_mb, i.cpu_limit_seconds, i.disk_limit_mb,
-                    i.created_at, i.exit_code
+                    i.created_at, i.exit_code, i.preset
              FROM instances i JOIN users u ON u.id = i.owner_id
              ORDER BY i.id",
         )?;
@@ -498,6 +532,7 @@ fn map_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         disk_limit_mb: row.get(9)?,
         created_at: row.get(10)?,
         exit_code: row.get(11)?,
+        preset: Preset::from_slug(&row.get::<_, String>(12)?).unwrap_or_default(),
     })
 }
 
@@ -569,9 +604,9 @@ mod tests {
         let bob = db
             .create_user("bob", "b@example.com", "h", Role::User, 1)
             .unwrap();
-        db.create_instance("a-web", alice, 8100, 128, 30, 512, 1)
+        db.create_instance("a-web", alice, 8100, 128, 30, 512, "hello-world", 1)
             .unwrap();
-        db.create_instance("b-web", bob, 8101, 128, 30, 512, 1)
+        db.create_instance("b-web", bob, 8101, 128, 30, 512, "hello-world", 1)
             .unwrap();
 
         let all = db.list_instances(None).unwrap();
@@ -605,7 +640,7 @@ mod tests {
         let id = db
             .create_user("alice", "a@example.com", "h", Role::User, 1)
             .unwrap();
-        db.create_instance("a-web", id, 8100, 128, 30, 512, 1)
+        db.create_instance("a-web", id, 8100, 128, 30, 512, "hello-world", 1)
             .unwrap();
         db.delete_user(id).unwrap();
         assert!(db.list_instances(None).unwrap().is_empty());

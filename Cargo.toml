@@ -1,5 +1,5 @@
 [workspace]
-members = ["panel", "hello-server"]
+members = ["benchmarker", "hello-server", "panel"]
 resolver = "2"
 
 [workspace.package]

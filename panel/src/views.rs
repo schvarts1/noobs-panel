@@ -1,6 +1,7 @@
 //! The HTML pages of the panel.
 
 use crate::models::{Instance, Role, User};
+use crate::presets::Preset;
 use crate::web::escape;
 
 /// The stylesheet shared by every page.
@@ -65,6 +66,18 @@ input, select {
 }
 input:focus, select:focus { outline: 2px solid var(--accent-2); outline-offset: -1px; border-color: var(--accent); }
 .field { margin-bottom: .9rem; }
+select {
+  width: 100%; padding: .5rem .6rem; border-radius: 7px; border: 1px solid var(--border);
+  background: var(--panel-2); color: var(--text); font-size: .92rem; font-family: inherit;
+}
+.choices { display: flex; flex-direction: column; gap: .5rem; }
+.choice {
+  display: grid; grid-template-columns: auto 1fr; gap: .1rem .6rem; align-items: center;
+  padding: .6rem .7rem; border: 1px solid var(--border); border-radius: 7px; cursor: pointer;
+}
+.choice:has(input:checked) { border-color: var(--accent); }
+.choice-name { font-weight: 600; }
+.choice-text { grid-column: 2; opacity: .7; font-size: .85rem; }
 button, .btn {
   display: inline-block; padding: .5rem .95rem; border-radius: 7px; border: 1px solid var(--border);
   background: var(--panel-2); color: var(--text); cursor: pointer; font-size: .92rem; font-family: inherit;
@@ -103,9 +116,10 @@ code { background: var(--panel-2); padding: .1rem .35rem; border-radius: 4px; fo
 fn layout(title: &str, user: Option<&User>, csrf: &str, content: &str) -> String {
     let nav = match user {
         Some(user) => {
-            let mut nav =
-                r#"<a href="/dashboard">Dashboard</a><a href="/instances/new">New instance</a>"#
-                    .to_string();
+            let mut nav = r#"<a href="/dashboard">Dashboard</a>"#.to_string();
+            if user.is_admin() {
+                nav.push_str(r#"<a href="/instances/new">New instance</a>"#);
+            }
             if user.is_admin() {
                 nav.push_str(r#"<a href="/admin">Admin</a>"#);
             }
@@ -227,7 +241,11 @@ pub fn dashboard_page(
         cards.push_str(&instance_card(instance));
     }
     if cards.is_empty() {
-        cards = r#"<div class="card empty">You have no instances yet. <a href="/instances/new">Create one</a>.</div>"#.to_string();
+        cards = if user.is_admin() {
+            r#"<div class="card empty">You have no instances yet. <a href="/instances/new">Create one</a>.</div>"#.to_string()
+        } else {
+            r#"<div class="card empty">You have no instances yet. An administrator has to give you one.</div>"#.to_string()
+        };
     }
 
     let content = format!(
@@ -242,7 +260,7 @@ pub fn dashboard_page(
 <div class="card">
   <div class="row" style="justify-content:space-between">
     <h2 style="margin:0">Your instances</h2>
-    <a class="btn primary" href="/instances/new">New instance</a>
+    {new_button}
   </div>
 </div>
 <div class="grid">{cards}</div>"#,
@@ -256,6 +274,11 @@ pub fn dashboard_page(
         disk = used_disk,
         disk_max = user.disk_limit_mb,
         cards = cards,
+        new_button = if user.is_admin() {
+            r#"<a class="btn primary" href="/instances/new">New instance</a>"#
+        } else {
+            ""
+        },
     );
     layout("Dashboard", Some(user), csrf, &content)
 }
@@ -288,19 +311,26 @@ pub fn new_instance_page(
     used_memory: i64,
     used_cpu: i64,
     used_disk: i64,
+    users: &[User],
 ) -> String {
     let notice = error
         .map(|msg| format!(r#"<div class="notice error">{}</div>"#, escape(msg)))
         .unwrap_or_default();
+    let presets = preset_options();
+    let owners = owner_options(users, user.id);
     let content = format!(
         r#"<h1>New instance</h1>
-<p class="sub">Create a web server with the resources you have left.</p>
+<p class="sub">Create a web server and hand it to an account.</p>
 {notice}
 <div class="card">
 <form method="post" action="/instances/new">
 <input type="hidden" name="_csrf" value="{csrf}">
 <div class="field"><label for="name">Name</label>
 <input id="name" name="name" placeholder="my-web" required autofocus></div>
+<div class="field"><label for="owner">For the account</label>
+<select id="owner" name="owner" required>{owners}</select></div>
+<div class="field"><label>Preset</label>
+<div class="choices">{presets}</div></div>
 <div class="field"><label for="memory">Memory limit (MB)</label>
 <input id="memory" name="memory" type="number" min="16" max="{max_memory}" value="128" required></div>
 <div class="field"><label for="cpu">CPU time limit (seconds)</label>
@@ -321,6 +351,8 @@ pub fn new_instance_page(
 </div>"#,
         notice = notice,
         csrf = escape(csrf),
+        presets = presets,
+        owners = owners,
         max_memory = user.memory_limit_mb,
         max_cpu = user.cpu_limit_seconds,
         max_disk = user.disk_limit_mb,
@@ -331,7 +363,45 @@ pub fn new_instance_page(
     layout("New instance", Some(user), csrf, &content)
 }
 
+/// The presets, as a set of radio buttons.
+fn preset_options() -> String {
+    Preset::ALL
+        .iter()
+        .map(|preset| {
+            format!(
+                r#"<label class="choice"><input type="radio" name="preset" value="{slug}"{checked}>
+<span class="choice-name">{label}</span><span class="choice-text">{text}</span></label>"#,
+                slug = escape(preset.slug()),
+                checked = if *preset == Preset::HelloWorld {
+                    " checked"
+                } else {
+                    ""
+                },
+                label = escape(preset.label()),
+                text = escape(preset.description()),
+            )
+        })
+        .collect()
+}
+
+/// The accounts an instance can be handed to.
+fn owner_options(users: &[User], selected: i64) -> String {
+    users
+        .iter()
+        .filter(|user| user.is_active)
+        .map(|user| {
+            format!(
+                r#"<option value="{id}"{selected}>{name}</option>"#,
+                id = user.id,
+                selected = if user.id == selected { " selected" } else { "" },
+                name = escape(&user.username),
+            )
+        })
+        .collect()
+}
+
 /// The detail page of a single instance.
+#[allow(clippy::too_many_arguments)]
 pub fn instance_page(
     user: &User,
     instance: &Instance,
@@ -340,6 +410,7 @@ pub fn instance_page(
     cpu_seconds: u64,
     disk_kb: u64,
     is_admin: bool,
+    users: &[User],
 ) -> String {
     let content = format!(
         r#"<h1>{name}</h1>
@@ -382,9 +453,11 @@ pub fn instance_page(
   <table>
     <tr><th>Url</th><td class="mono">{url}</td></tr>
     <tr><th>Process id</th><td class="mono">{pid}</td></tr>
+    <tr><th>Preset</th><td>{preset_label}</td></tr>
     {owner_row}
   </table>
-</div>"#,
+</div>
+{assign_card}"#,
         name = escape(&instance.name),
         owner = escape(&instance.owner_username),
         state = instance.state.as_db(),
@@ -405,11 +478,31 @@ pub fn instance_page(
             .pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_string()),
+        preset_label = escape(instance.preset.label()),
         owner_row = if is_admin {
             format!(
                 r#"<tr><th>Owner</th><td><a href="/admin/users/{owner_id}">{}</a></td></tr>"#,
                 escape(&instance.owner_username),
                 owner_id = instance.owner_id
+            )
+        } else {
+            String::new()
+        },
+        assign_card = if is_admin {
+            let options = owner_options(users, instance.owner_id);
+            format!(
+                r#"<div class="card">
+  <h2 style="margin-top:0">Hand to another account</h2>
+  <form method="post" action="/instances/{id}/owner">
+    <input type="hidden" name="_csrf" value="{csrf}">
+    <div class="field"><label for="owner-{id}">Owner</label>
+    <select id="owner-{id}" name="owner">{options}</select></div>
+    <button type="submit">Hand over</button>
+  </form>
+</div>"#,
+                id = instance.id,
+                csrf = escape(csrf),
+                options = options,
             )
         } else {
             String::new()
@@ -446,6 +539,48 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
         ));
     }
 
+    // Every instance, with the account it belongs to and the account it
+    // could be handed to.
+    let mut instance_rows = String::new();
+    for instance in instances {
+        let options = owner_options(users, instance.owner_id);
+        instance_rows.push_str(&format!(
+            r#"<tr>
+  <td><a href="/instances/{id}">{name}</a></td>
+  <td>{preset}</td>
+  <td><a href="/admin/users/{owner_id}">{owner}</a></td>
+  <td>{port}</td>
+  <td>{memory} MB</td>
+  <td>{cpu} s</td>
+  <td>{disk} MB</td>
+  <td><span class="badge {state}">{label}</span></td>
+  <td>
+    <form method="post" action="/instances/{id}/owner" class="row" style="margin:0">
+      <input type="hidden" name="_csrf" value="{csrf}">
+      <select name="owner" style="width:auto">{options}</select>
+      <button type="submit">Hand over</button>
+    </form>
+  </td>
+</tr>"#,
+            id = instance.id,
+            name = escape(&instance.name),
+            preset = escape(instance.preset.label()),
+            owner_id = instance.owner_id,
+            owner = escape(&instance.owner_username),
+            port = instance.port,
+            memory = instance.memory_limit_mb,
+            cpu = instance.cpu_limit_seconds,
+            disk = instance.disk_limit_mb,
+            state = instance.state.as_db(),
+            label = instance.state.label(),
+            csrf = escape(csrf),
+            options = options,
+        ));
+    }
+    if instance_rows.is_empty() {
+        instance_rows = r#"<tr><td colspan="9">There are no instances yet.</td></tr>"#.to_string();
+    }
+
     let content = format!(
         r#"<h1>Administration</h1>
 <p class="sub">Accounts and instances on this panel.</p>
@@ -460,11 +595,22 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
     <tr><th>Username</th><th>Role</th><th>Email</th><th>Memory</th><th>CPU</th><th>Disk</th><th>Instances</th><th>State</th></tr>
     {rows}
   </table>
+</div>
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0">Instances</h2>
+    <a class="btn primary" href="/instances/new">New instance</a>
+  </div>
+  <table>
+    <tr><th>Name</th><th>Preset</th><th>Owner</th><th>Port</th><th>Memory</th><th>CPU</th><th>Disk</th><th>State</th><th>Hand over</th></tr>
+    {instance_rows}
+  </table>
 </div>"#,
         user_count = users.len(),
         admin_count = users.iter().filter(|u| u.is_admin()).count(),
         instance_count = instances.len(),
         rows = rows,
+        instance_rows = instance_rows,
     );
     layout("Administration", Some(admin), csrf, &content)
 }
@@ -636,6 +782,7 @@ mod tests {
             disk_limit_mb: 512,
             created_at: 0,
             exit_code: None,
+            preset: Preset::HelloWorld,
         }
     }
 
@@ -645,7 +792,7 @@ mod tests {
         assert!(html.contains("alice"));
         assert!(!html.contains("<script"));
 
-        let html = instance_page(&user(), &instance(), "csrf", 0, 0, 0, false);
+        let html = instance_page(&user(), &instance(), "csrf", 0, 0, 0, false, &[]);
         assert!(html.contains("8100"));
     }
 

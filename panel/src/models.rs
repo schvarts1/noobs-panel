@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::presets::Preset;
+
 /// Role of an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -150,6 +152,8 @@ pub struct Instance {
     pub created_at: i64,
     /// Most recent recorded exit status, if the instance has crashed.
     pub exit_code: Option<i32>,
+    /// The kind of workload the instance runs.
+    pub preset: Preset,
 }
 
 impl Instance {
@@ -235,6 +239,7 @@ mod tests {
             disk_limit_mb: 512,
             created_at: 0,
             exit_code: None,
+            preset: Preset::HelloWorld,
         };
         assert_eq!(instance.url(), "http://127.0.0.1:8123");
         assert!(instance.is_running());

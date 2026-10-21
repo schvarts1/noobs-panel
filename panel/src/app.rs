@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::instances::InstanceManager;
 use crate::models::{Instance, Role, User};
+use crate::presets::Preset;
 use crate::views;
 use crate::web::{self, WebRequest};
 
@@ -55,6 +56,7 @@ pub fn handle(app: &App, request: &WebRequest) -> Response {
         ("GET", ["dashboard"]) => dashboard(app, request),
         ("GET", ["instances", "new"]) => new_instance_page(app, request),
         ("POST", ["instances", "new"]) => create_instance(app, request),
+        ("POST", ["instances", id, "owner"]) => assign_instance(app, request, id),
         ("GET", ["instances", id]) => instance_detail(app, request, id),
         ("POST", ["instances", id, "start"]) => start_instance(app, request, id),
         ("POST", ["instances", id, "stop"]) => stop_instance(app, request, id),
@@ -411,11 +413,13 @@ fn used_resources(app: &App, instances: &[Instance]) -> (i64, i64, i64) {
 
 /// The page for creating an instance.
 fn new_instance_page(app: &App, request: &WebRequest) -> Response {
-    let identity = match require_identity(app, request) {
+    // Only an administrator creates instances and hands them out.
+    let identity = match require_admin(app, request) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
 
+    let users = app.db.all_users().unwrap_or_default();
     let instances = app
         .db
         .list_instances(Some(identity.user.id))
@@ -424,13 +428,22 @@ fn new_instance_page(app: &App, request: &WebRequest) -> Response {
 
     web::html(
         200,
-        views::new_instance_page(&identity.user, &identity.csrf, None, memory, cpu, disk),
+        views::new_instance_page(
+            &identity.user,
+            &identity.csrf,
+            None,
+            memory,
+            cpu,
+            disk,
+            &users,
+        ),
     )
 }
 
 /// Handle the create instance form.
 fn create_instance(app: &App, request: &WebRequest) -> Response {
-    let identity = match require_identity(app, request) {
+    // Only an administrator creates instances and hands them out.
+    let identity = match require_admin(app, request) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -443,49 +456,35 @@ fn create_instance(app: &App, request: &WebRequest) -> Response {
         return render_new_instance(app, &identity, Some(&message));
     }
 
+    // The preset decides what the instance runs.
+    let preset = match Preset::from_slug(&request.trimmed_field("preset")) {
+        Some(preset) => preset,
+        None => return render_new_instance(app, &identity, Some("Please choose a preset.")),
+    };
+
     let memory = request.number_field("memory").unwrap_or(0);
     let cpu = request.number_field("cpu").unwrap_or(0);
     let disk = request.number_field("disk").unwrap_or(0);
 
-    let user = &identity.user;
-
-    // The requested limits must be positive and fit inside the quota of the
-    // account.
     if memory < 16 || cpu < 1 || disk < 16 {
         return render_new_instance(app, &identity, Some("Those resource limits are too small."));
     }
-    if memory > user.memory_limit_mb || cpu > user.cpu_limit_seconds || disk > user.disk_limit_mb {
-        return render_new_instance(
-            app,
-            &identity,
-            Some("Those limits are larger than the resources your account has."),
-        );
-    }
 
-    let instances = app.db.list_instances(Some(user.id)).unwrap_or_default();
-    if instances.len() as i64 >= user.instance_limit {
-        return render_new_instance(
-            app,
-            &identity,
-            Some("You have reached the maximum number of instances."),
-        );
-    }
-
-    let (used_memory, used_cpu, used_disk) = used_resources(app, &instances);
-    if used_memory + memory > user.memory_limit_mb
-        || used_cpu + cpu > user.cpu_limit_seconds
-        || used_disk + disk > user.disk_limit_mb
-    {
-        return render_new_instance(
-            app,
-            &identity,
-            Some("You do not have enough resources left for that instance."),
-        );
+    // The instance belongs to the account the administrator picks, and that
+    // account has to have room for it.
+    let owner = match resolve_owner(app, request) {
+        Ok(owner) => owner,
+        Err(message) => return render_new_instance(app, &identity, Some(&message)),
+    };
+    if let Err(message) = quota_allows(app, &owner, memory, cpu, disk, None) {
+        return render_new_instance(app, &identity, Some(&message));
     }
 
     // Find a port that is not in use by an instance and not taken on the
-    // network.
-    let used_ports: Vec<u16> = instances.iter().map(|i| i.port).collect();
+    // network. The ports of every instance count, not only the ones of the
+    // owner, because a port is used on the whole machine.
+    let all = app.db.list_instances(None).unwrap_or_default();
+    let used_ports: Vec<u16> = all.iter().map(|i| i.port).collect();
     let port = match (app.config.instance_ports.0..=app.config.instance_ports.1)
         .find(|port| !used_ports.contains(port))
     {
@@ -499,22 +498,130 @@ fn create_instance(app: &App, request: &WebRequest) -> Response {
         }
     };
 
-    if let Err(err) = app
-        .db
-        .create_instance(&name, user.id, port, memory, cpu, disk, now())
+    let id = match app.db.create_instance(
+        &name,
+        owner.id,
+        port,
+        memory,
+        cpu,
+        disk,
+        preset.slug(),
+        now(),
+    ) {
+        Ok(id) => id,
+        Err(err) => {
+            return render_new_instance(
+                app,
+                &identity,
+                Some(&format!("Cannot create the instance: {err}")),
+            )
+        }
+    };
+
+    // The page of the new instance is more useful than the dashboard,
+    // because the instance belongs to somebody else.
+    web::redirect(&format!("/instances/{id}"))
+}
+
+/// The account an instance is created for or handed to.
+///
+/// An administrator may pick any account, and the account has to be one
+/// that can use the machine.
+fn resolve_owner(app: &App, request: &WebRequest) -> std::result::Result<User, String> {
+    let Some(id) = request.number_field("owner") else {
+        return Err("Please choose the account the instance is for.".into());
+    };
+    match app.db.user_by_id(id) {
+        Ok(Some(user)) if user.is_active => Ok(user),
+        _ => Err("That account does not exist.".into()),
+    }
+}
+
+/// Whether an account has room for an instance with these limits.
+///
+/// The instance that is being moved is left out of the count, so that an
+/// instance can be handed to an account that already holds it.
+fn quota_allows(
+    app: &App,
+    owner: &User,
+    memory: i64,
+    cpu: i64,
+    disk: i64,
+    skip: Option<i64>,
+) -> std::result::Result<(), String> {
+    let instances = app.db.list_instances(Some(owner.id)).unwrap_or_default();
+    let instances: Vec<Instance> = instances
+        .into_iter()
+        .filter(|instance| Some(instance.id) != skip)
+        .collect();
+
+    if instances.len() as i64 >= owner.instance_limit {
+        return Err("That account has reached the maximum number of instances.".into());
+    }
+
+    let (used_memory, used_cpu, used_disk) = used_resources(app, &instances);
+    if used_memory + memory > owner.memory_limit_mb
+        || used_cpu + cpu > owner.cpu_limit_seconds
+        || used_disk + disk > owner.disk_limit_mb
     {
-        return render_new_instance(
+        return Err("That account does not have enough resources left for this instance.".into());
+    }
+
+    Ok(())
+}
+
+/// Hand an instance to another account.
+fn assign_instance(app: &App, request: &WebRequest, id: &str) -> Response {
+    // Only an administrator hands instances out.
+    let identity = match require_admin(app, request) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&identity, request) {
+        return response;
+    }
+
+    let id: i64 = match id.parse() {
+        Ok(id) => id,
+        Err(_) => return not_found(app, request),
+    };
+    let instance = match app.db.instance_by_id(id) {
+        Ok(Some(instance)) => instance,
+        _ => return not_found(app, request),
+    };
+
+    let owner = match resolve_owner(app, request) {
+        Ok(owner) => owner,
+        Err(message) => return render_instance_error(app, &identity, &instance, &message),
+    };
+
+    // The new owner has to have room for the instance.
+    if let Err(message) = quota_allows(
+        app,
+        &owner,
+        instance.memory_limit_mb,
+        instance.cpu_limit_seconds,
+        instance.disk_limit_mb,
+        Some(instance.id),
+    ) {
+        return render_instance_error(app, &identity, &instance, &message);
+    }
+
+    if let Err(err) = app.db.set_instance_owner(instance.id, owner.id) {
+        return render_instance_error(
             app,
             &identity,
-            Some(&format!("Cannot create the instance: {err}")),
+            &instance,
+            &format!("Cannot hand over the instance: {err}"),
         );
     }
 
-    web::redirect("/dashboard")
+    web::redirect(&format!("/instances/{}", instance.id))
 }
 
 /// Render the create instance page with an error message.
 fn render_new_instance(app: &App, identity: &Identity, error: Option<&str>) -> Response {
+    let users = app.db.all_users().unwrap_or_default();
     let instances = app
         .db
         .list_instances(Some(identity.user.id))
@@ -522,7 +629,15 @@ fn render_new_instance(app: &App, identity: &Identity, error: Option<&str>) -> R
     let (memory, cpu, disk) = used_resources(app, &instances);
     web::html(
         200,
-        views::new_instance_page(&identity.user, &identity.csrf, error, memory, cpu, disk),
+        views::new_instance_page(
+            &identity.user,
+            &identity.csrf,
+            error,
+            memory,
+            cpu,
+            disk,
+            &users,
+        ),
     )
 }
 
@@ -559,6 +674,7 @@ fn instance_detail(app: &App, request: &WebRequest, id: &str) -> Response {
     let usage = app.manager.usage(&instance);
     let disk = app.manager.disk_usage(&app.config.data_dir, &instance);
 
+    let users = app.db.all_users().unwrap_or_default();
     web::html(
         200,
         views::instance_page(
@@ -569,6 +685,7 @@ fn instance_detail(app: &App, request: &WebRequest, id: &str) -> Response {
             usage.cpu_seconds,
             disk,
             identity.user.is_admin(),
+            &users,
         ),
     )
 }
@@ -891,6 +1008,7 @@ fn render_instance_error(
 ) -> Response {
     let usage = app.manager.usage(instance);
     let disk = app.manager.disk_usage(&app.config.data_dir, instance);
+    let users = app.db.all_users().unwrap_or_default();
     let mut html = views::instance_page(
         &identity.user,
         instance,
@@ -899,6 +1017,7 @@ fn render_instance_error(
         usage.cpu_seconds,
         disk,
         identity.user.is_admin(),
+        &users,
     );
     // The error is shown above the page content.
     let notice = format!(

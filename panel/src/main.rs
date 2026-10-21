@@ -11,6 +11,7 @@ use panel::app::{self, App};
 use panel::config::Config;
 use panel::db::Database;
 use panel::instances::InstanceManager;
+use panel::presets::Preset;
 use panel::web::WebRequest;
 
 /// Command line options.
@@ -200,8 +201,13 @@ fn main() -> ExitCode {
             requested_port, bound.port
         );
     }
-    if manager.instance_binary().is_none() {
-        println!("  Warning:    the hello-server binary was not found, instances cannot start.");
+    for preset in Preset::ALL {
+        if manager.instance_binary(preset).is_none() {
+            println!(
+                "  Warning:    the {} binary was not found, instances with that preset cannot start.",
+                preset.binary()
+            );
+        }
     }
     println!("  Stop with:  Ctrl+C");
     println!();

@@ -14,6 +14,7 @@ but much simpler.
 | ------- | ----------- |
 | [`panel`](panel/) | The panel itself: accounts, administrators and instances. |
 | [`hello-server`](hello-server/) | The tiny web server that instances run. |
+| [`benchmarker`](benchmarker/) | The workload that checks the limits of an instance. |
 
 ## Quick start
 
@@ -51,7 +52,8 @@ same way `hello-server` does.
 | `NOOBS_PANEL_HOST` | Same as `--host` |
 | `NOOBS_PANEL_DATA` | Same as `--data-dir` |
 | `NOOBS_PANEL_INSTANCE_PORTS` | Port range for instances, as `START-END` |
-| `NOOBS_INSTANCE_BIN` | Path of the binary used to run instances |
+| `NOOBS_INSTANCE_BIN` | Path of the `hello-server` binary |
+| `NOOBS_BENCHMARKER_BIN` | Path of the `benchmarker` binary |
 
 ### Accounts
 
@@ -64,8 +66,35 @@ only see and manage their own.
 
 ### Instances
 
-An instance is a `hello-server` process. Creating one asks for a name and
-three limits:
+Only an administrator creates instances. The form asks for the account the
+instance is for, so an instance is always handed out to somebody. The
+administrator can move an instance to another account at any time, from the
+page of the instance or from the admin area. A regular user can start, stop
+and delete the instances that belong to them, but cannot create new ones or
+take them away.
+
+An instance runs a preset. There are two of them:
+
+| Preset | What it does |
+| ------ | ------------ |
+| **Hello World** | A small web server that greets every visitor. Use it to see that an instance runs and answers. |
+| **Benchmarker** | A web server that uses as much memory, processor time and disk as it can, so the limits of the instance can be checked. |
+
+The benchmarker serves a page that shows how much of the granted resources
+is in use, and it can be asked to push against the limits:
+
+| Address | What it does |
+| ------- | ------------ |
+| `/` | The page with the usage and the limits the kernel gave the process |
+| `/stress/memory` | Takes as much memory as it can, until the kernel refuses |
+| `/stress/disk` | Writes a file until the kernel refuses |
+| `/stress/cpu` | Uses the processor until the kernel stops the instance |
+
+The processor test ends the instance on purpose, because that is the only
+way to see that the limit is real. The panel then shows the instance as
+stopped, and the log of the instance says what happened.
+
+Creating an instance asks for a name and three limits:
 
 | Limit | Meaning |
 | ----- | ------- |
@@ -100,7 +129,9 @@ cargo test
 The suite covers the argument parsing, the port search, the database, the
 password hashing, and the whole panel over HTTP: signing up, signing in, the
 csrf protection, the role checks, the resource quotas and the life cycle of
-an instance, which is really started and really serves a request.
+an instance, which is really started and really serves a request. The
+benchmarker is tested as well, and it really runs into the limits it is
+given.
 
 ## Layout
 
@@ -111,6 +142,7 @@ an instance, which is really started and really serves a request.
 | `panel/src/config.rs` | Configuration |
 | `panel/src/db.rs` | SQLite storage |
 | `panel/src/instances.rs` | Starting, stopping and limiting instances |
+| `panel/src/presets.rs` | The kinds of workload an instance can run |
 | `panel/src/models.rs` | Users, instances and their types |
 | `panel/src/views.rs` | The HTML pages |
 | `panel/src/web.rs` | Request parsing and responses |

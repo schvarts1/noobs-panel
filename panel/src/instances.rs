@@ -12,10 +12,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, Result as DbResult};
 use crate::models::{Instance, InstanceState, Usage};
+use crate::presets::Preset;
 
 /// Number of clock ticks per second, used to convert the cpu counters in
 /// `/proc/<pid>/stat` into seconds.
 const CLOCK_TICKS_PER_SECOND: f64 = 100.0;
+
+/// How much processor time an instance may use past its limit, before the
+/// kernel stops it without asking.
+const CPU_GRACE_SECONDS: u64 = 5;
 
 /// Resource limits applied to a child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +51,8 @@ struct Managed {
 /// Keeps track of the running instance processes.
 pub struct InstanceManager {
     running: Mutex<HashMap<i64, Managed>>,
-    binary: Mutex<Option<PathBuf>>,
+    /// The binary of every preset, found when it is first needed.
+    binaries: Mutex<HashMap<&'static str, PathBuf>>,
 }
 
 impl Default for InstanceManager {
@@ -60,25 +66,30 @@ impl InstanceManager {
     pub fn new() -> InstanceManager {
         InstanceManager {
             running: Mutex::new(HashMap::new()),
-            binary: Mutex::new(None),
+            binaries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The path of the binary that instances are started from.
+    /// The path of the binary that runs a preset.
     ///
     /// The lookup is cached, because it touches the file system.
-    pub fn instance_binary(&self) -> Option<PathBuf> {
-        if let Some(path) = self.binary.lock().unwrap().clone() {
-            return Some(path);
+    pub fn instance_binary(&self, preset: Preset) -> Option<PathBuf> {
+        if let Some(path) = self.binaries.lock().unwrap().get(preset.binary()) {
+            return Some(path.clone());
         }
-        let found = find_instance_binary();
-        *self.binary.lock().unwrap() = found.clone();
+        let found = find_binary(preset);
+        if let Some(path) = &found {
+            self.binaries
+                .lock()
+                .unwrap()
+                .insert(preset.binary(), path.clone());
+        }
         found
     }
 
-    /// Override the binary used for new instances.
-    pub fn set_instance_binary(&self, path: PathBuf) {
-        *self.binary.lock().unwrap() = Some(path);
+    /// Override the binary used for a preset.
+    pub fn set_instance_binary(&self, preset: Preset, path: PathBuf) {
+        self.binaries.lock().unwrap().insert(preset.binary(), path);
     }
 
     /// Start the web server for an instance.
@@ -95,9 +106,13 @@ impl InstanceManager {
             }
         }
 
-        let binary = self
-            .instance_binary()
-            .ok_or_else(|| "Cannot find the instance binary (hello-server).".to_string())?;
+        let binary = self.instance_binary(instance.preset).ok_or_else(|| {
+            format!(
+                "Cannot find the binary of the preset {} ({}).",
+                instance.preset.label(),
+                instance.preset.binary()
+            )
+        })?;
 
         let work_dir = data_dir.join(format!("instance-{}", instance.id));
         std::fs::create_dir_all(&work_dir)
@@ -265,28 +280,42 @@ impl InstanceManager {
 }
 
 /// Find the binary that instances are started from.
-pub fn find_instance_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("NOOBS_INSTANCE_BIN") {
+pub fn find_binary(preset: Preset) -> Option<PathBuf> {
+    // The environment can point at a binary.
+    let variable = match preset {
+        Preset::HelloWorld => "NOOBS_INSTANCE_BIN",
+        Preset::Benchmarker => "NOOBS_BENCHMARKER_BIN",
+    };
+    if let Ok(path) = std::env::var(variable) {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
         }
     }
 
-    // A binary next to the panel binary is the usual case, because both are
-    // built by cargo into the same target directory.
+    let name = preset.binary();
+
+    // A binary next to the panel binary is the usual case, because all of
+    // them are built by cargo into the same target directory. The
+    // directories above are looked at as well, because the tests run from
+    // somewhere inside the target tree.
     if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let candidate = dir.join("hello-server");
+        let mut directory = current.parent().map(|dir| dir.to_path_buf());
+        for _ in 0..4 {
+            let Some(current) = directory else {
+                break;
+            };
+            let candidate = current.join(name);
             if candidate.is_file() {
                 return Some(candidate);
             }
+            directory = current.parent().map(|dir| dir.to_path_buf());
         }
     }
 
     // Fall back to the usual cargo output directories.
     for profile in ["release", "debug"] {
-        let candidate = PathBuf::from("target").join(profile).join("hello-server");
+        let candidate = PathBuf::from("target").join(profile).join(name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -317,9 +346,17 @@ fn apply_limits(command: &mut Command, limits: ProcessLimits) -> std::result::Re
     // must not allocate or do anything that is not async signal safe.
     unsafe {
         command.pre_exec(move || {
-            set_limit(libc::RLIMIT_DATA, memory_bytes);
-            set_limit(libc::RLIMIT_FSIZE, disk_bytes);
-            set_limit(libc::RLIMIT_CPU, cpu_seconds);
+            set_limit(libc::RLIMIT_DATA, memory_bytes, memory_bytes);
+            set_limit(libc::RLIMIT_FSIZE, disk_bytes, disk_bytes);
+            // The soft limit is the one that counts. The hard limit is a
+            // little higher, so the kernel sends the signal that a program
+            // can handle first, and the hard limit only catches a program
+            // that ignores it.
+            set_limit(
+                libc::RLIMIT_CPU,
+                cpu_seconds,
+                cpu_seconds.saturating_add(CPU_GRACE_SECONDS),
+            );
             Ok(())
         });
     }
@@ -330,10 +367,10 @@ fn apply_limits(command: &mut Command, limits: ProcessLimits) -> std::result::Re
 ///
 /// A limit that the platform refuses to apply must not stop the instance
 /// from starting, otherwise one unsupported limit would break everything.
-unsafe fn set_limit(resource: libc::c_int, value: u64) {
+unsafe fn set_limit(resource: libc::c_int, soft: u64, hard: u64) {
     let limit = libc::rlimit {
-        rlim_cur: value,
-        rlim_max: value,
+        rlim_cur: soft,
+        rlim_max: hard,
     };
     libc::setrlimit(resource, &limit);
 }
