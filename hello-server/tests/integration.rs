@@ -23,7 +23,9 @@ struct Server {
 /// They sit below the operating system's ephemeral port range so that the
 /// kernel never hands one of them out to an unrelated connection, which would
 /// make the fallback assertions flaky.
-const PORTS: [u16; 6] = [18080, 18090, 18100, 18110, 18120, 18130];
+const PORTS: [u16; 9] = [
+    18080, 18090, 18100, 18110, 18120, 18130, 18140, 18150, 18160,
+];
 
 impl Server {
     /// Start the binary and wait until it reports the port it listens on.
@@ -76,6 +78,25 @@ impl Server {
             _stdout: pump,
             _blockers: blockers,
         }
+    }
+
+    /// Perform a raw HTTP/1.0 GET and return the whole answer.
+    fn request(&self, path: &str, headers: &[(&str, &str)]) -> String {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port);
+        let mut stream = TcpStream::connect(addr).expect("connection refused");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(stream, "GET {path} HTTP/1.0\r\nHost: localhost\r\n").unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
+        }
+        write!(stream, "\r\n").unwrap();
+        stream.flush().unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
     }
 
     /// Perform a raw HTTP/1.0 GET and return the status line plus body.
@@ -157,6 +178,106 @@ fn health_endpoint_responds() {
     let (status, body) = server.get("/health");
     assert!(status.contains("200 OK"), "unexpected status: {status}");
     assert_eq!(body.trim(), "ok");
+}
+
+#[test]
+fn the_files_of_a_site_are_served() {
+    let port = PORTS[6];
+    let directory = std::env::temp_dir().join(format!("hello-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("index.html"), "<h1>my own page</h1>").unwrap();
+    std::fs::write(directory.join("style.css"), "body { color: red; }").unwrap();
+
+    let server = Server::start(
+        &[
+            "--port",
+            &port.to_string(),
+            "--root",
+            directory.to_str().unwrap(),
+        ],
+        &[],
+    );
+
+    // The page of the site is served.
+    let (status, body) = server.get("/");
+    assert!(status.contains("200 OK"), "unexpected status: {status}");
+    assert!(body.contains("my own page"), "unexpected body: {body}");
+
+    // The style is served with its own kind of content.
+    let answer = server.request("/style.css", &[]);
+    assert!(answer.contains("200 OK"), "unexpected answer: {answer}");
+    assert!(answer.contains("text/css"), "unexpected answer: {answer}");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_file_that_did_not_change_is_not_sent_again() {
+    let port = PORTS[7];
+    let directory = std::env::temp_dir().join(format!("hello-site-2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("index.html"), "<h1>my own page</h1>").unwrap();
+
+    let server = Server::start(
+        &[
+            "--port",
+            &port.to_string(),
+            "--root",
+            directory.to_str().unwrap(),
+        ],
+        &[],
+    );
+
+    // The first answer has a mark of the file.
+    let answer = server.request("/", &[]);
+    let mark = answer
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("etag") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .expect("the answer should have a mark");
+    assert!(!mark.is_empty());
+
+    // The second answer says that nothing changed.
+    let answer = server.request("/", &[("If-None-Match", &mark)]);
+    assert!(
+        answer.contains("304"),
+        "the file should not be sent again: {answer}"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_path_cannot_reach_outside_the_site() {
+    let port = PORTS[8];
+    let directory = std::env::temp_dir().join(format!("hello-site-3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("index.html"), "<h1>my own page</h1>").unwrap();
+
+    let server = Server::start(
+        &[
+            "--port",
+            &port.to_string(),
+            "--root",
+            directory.to_str().unwrap(),
+        ],
+        &[],
+    );
+
+    // A file outside the directory is not served.
+    let (_status, body) = server.get("/../../../../etc/passwd");
+    assert!(!body.contains("root:"), "a file outside was served");
+
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]

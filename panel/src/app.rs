@@ -14,11 +14,14 @@ use crate::views;
 use crate::web::{self, WebRequest};
 
 /// The application state shared by every request.
+///
+/// It is held by an `Arc`, so the workers of the pool and the janitor
+/// thread can all use it.
 pub struct App {
     /// The panel configuration.
     pub config: Config,
     /// The database handle.
-    pub db: Database,
+    pub db: Arc<Database>,
     /// The running instance processes.
     pub manager: Arc<InstanceManager>,
 }
@@ -745,7 +748,13 @@ fn instance_detail(app: &App, request: &WebRequest, id: &str) -> Response {
     }
 
     let usage = app.manager.usage(&instance);
-    let disk = app.manager.disk_usage(&app.config.data_dir, &instance);
+    // The size of the directory is measured by the watcher, so the page is
+    // answered without walking the directory.
+    let disk = if usage.disk_kb > 0 {
+        usage.disk_kb
+    } else {
+        app.manager.disk_usage(&app.config.data_dir, &instance)
+    };
 
     let users = app.db.all_users().unwrap_or_default();
     web::html(
@@ -1190,12 +1199,9 @@ fn admin_set_password(app: &App, request: &WebRequest, id: &str) -> Response {
 
 /// The number of administrators on the panel.
 fn admin_count(app: &App) -> usize {
-    app.db
-        .all_users()
-        .unwrap_or_default()
-        .iter()
-        .filter(|user| user.is_admin())
-        .count()
+    // When the count cannot be read, one is assumed, so that the last
+    // administrator cannot be demoted by accident.
+    app.db.admin_count().unwrap_or(1).max(1) as usize
 }
 
 /// Render the admin page of an account with a notice.
@@ -1227,7 +1233,11 @@ fn render_instance_error(
     message: &str,
 ) -> Response {
     let usage = app.manager.usage(instance);
-    let disk = app.manager.disk_usage(&app.config.data_dir, instance);
+    let disk = if usage.disk_kb > 0 {
+        usage.disk_kb
+    } else {
+        app.manager.disk_usage(&app.config.data_dir, instance)
+    };
     let users = app.db.all_users().unwrap_or_default();
     let mut html = views::instance_page(
         &identity.user,

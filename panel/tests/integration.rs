@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 struct Panel {
     child: Child,
     port: u16,
+    /// The directory the panel keeps its database and its instances in.
+    data_dir: std::path::PathBuf,
     /// Keeps the stdout pipe open so the server is not killed by SIGPIPE.
     _stdout: std::thread::JoinHandle<String>,
 }
@@ -190,6 +192,11 @@ fn extract_owner(html: &str, username: &str) -> String {
 
 /// Start a panel on a free port with a fresh database.
 fn start_panel() -> Panel {
+    start_panel_with_janitor(300)
+}
+
+/// Start a panel whose janitor runs every given number of seconds.
+fn start_panel_with_janitor(janitor_interval: u64) -> Panel {
     // Every test needs its own data directory, so the database of one test
     // cannot be seen by another.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -218,6 +225,7 @@ fn start_panel() -> Panel {
             "NOOBS_PANEL_INSTANCE_PORTS",
             format!("{}-{}", 19000 + unique * 10, 19009 + unique * 10),
         )
+        .env("NOOBS_PANEL_JANITOR_INTERVAL", janitor_interval.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -243,6 +251,7 @@ fn start_panel() -> Panel {
     Panel {
         child,
         port,
+        data_dir,
         _stdout: pump,
     }
 }
@@ -1227,6 +1236,145 @@ fn an_instance_is_kept_inside_its_share_of_the_processor() {
     // The panel shows the share it holds the instance to.
     let answer = client.get("/api/usage");
     assert!(answer.body.contains("\"cpu_percent\""));
+}
+
+/// The panel answers more than one request at the same time.
+///
+/// The requests are sent at the same moment, and they all have to be
+/// answered.
+#[test]
+fn the_panel_answers_many_requests_at_once() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let _ = signed_in_client(&panel, "alice");
+
+    // Ten threads ask for the same page at the same time.
+    let port = panel.port;
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut client = Client::new(port);
+                let reply = client.get("/login");
+                reply.status
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), 200);
+    }
+
+    // The panel is still working afterwards.
+    assert_eq!(admin.get("/dashboard").status, 200);
+}
+
+/// A page that takes a moment does not hold up the other requests.
+///
+/// The usage of the instances used to be worked out by waiting a quarter of
+/// a second, so a page could hold up the whole panel.
+#[test]
+fn a_slow_page_does_not_hold_up_the_others() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let _ = signed_in_client(&panel, "alice");
+
+    // Ten threads ask for the usage at the same time, while the panel is
+    // busy with the pages of the instances.
+    let port = panel.port;
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut client = Client::new(port);
+                let start = Instant::now();
+                let reply = client.get("/api/usage");
+                (reply.status, start.elapsed())
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (status, took) = handle.join().unwrap();
+        assert_eq!(status, 200);
+        // The usage of the instances comes from the watcher, so the answer
+        // does not wait.
+        assert!(
+            took < Duration::from_secs(2),
+            "the answer took {took:?}, which is too long"
+        );
+    }
+
+    assert_eq!(admin.get("/dashboard").status, 200);
+}
+
+/// The tables of the sessions and the csrf tokens do not grow for ever.
+///
+/// The janitor of the panel throws away the rows that have expired.
+#[test]
+fn the_janitor_throws_the_expired_rows_away() {
+    let panel = start_panel_with_janitor(1);
+    let mut client = Client::new(panel.port);
+
+    // A visitor that is not signed in gets a csrf token that is kept on
+    // the server.
+    let page = client.get("/login");
+    assert_eq!(page.status, 200);
+
+    let database = panel.data_dir.join("panel.db");
+    assert!(database.exists(), "the database should be there");
+    assert!(
+        count_rows(&database, "csrf_tokens") >= 1,
+        "the csrf token should be in the database"
+    );
+
+    // A row that has expired is put in the database by hand.
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO csrf_tokens (token, created_at, expires_at) VALUES (?1, 0, 1)",
+            ["expired-token"],
+        )
+        .unwrap();
+    drop(connection);
+
+    // The janitor takes it away.
+    let mut gone = false;
+    for _ in 0..100 {
+        if count_token(&database, "expired-token") == 0 {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        gone,
+        "the janitor should have thrown the expired token away"
+    );
+}
+
+/// The number of rows a table has.
+fn count_rows(database: &std::path::Path, table: &str) -> i64 {
+    let Ok(connection) = rusqlite::Connection::open(database) else {
+        return -1;
+    };
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(-1)
+}
+
+/// The number of rows of a csrf token that is still there.
+fn count_token(database: &std::path::Path, token: &str) -> i64 {
+    let Ok(connection) = rusqlite::Connection::open(database) else {
+        return -1;
+    };
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM csrf_tokens WHERE token = ?1",
+            [token],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(-1)
 }
 
 /// Ask a server on a port for a page.

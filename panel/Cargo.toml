@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "A simple Pterodactyl-like panel: users, admins, and resource limited web server instances."
 
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
 [dependencies]
 tiny_http = "0.12.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

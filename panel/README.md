@@ -33,6 +33,12 @@ The hello world and the site preset serve the files of the directory of the
 instance, so the user can write the html, the style and the script of their
 site in the editor at `/instances/<id>/site`.
 
+The requests are answered by a pool of workers, so a slow request does not
+hold up the others. Nothing in a request waits for a moment: the numbers of
+the dashboard come from the watcher of the instance. The janitor throws the
+sessions that have expired away every few minutes, so the database stays
+small.
+
 ## Layout
 
 | File | Contents |
@@ -42,6 +48,8 @@ site in the editor at `/instances/<id>/site`.
 | `src/config.rs` | Configuration |
 | `src/db.rs` | SQLite storage |
 | `src/instances.rs` | Starting, stopping and limiting instances |
+| `src/janitor.rs` | Throwing away the sessions that have expired |
+| `src/pool.rs` | The workers that answer the requests |
 | `src/presets.rs` | The kinds of workload an instance can run |
 | `src/site.rs` | The files of the site of an instance |
 | `src/models.rs` | Users, instances and their types |

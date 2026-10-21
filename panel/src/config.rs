@@ -15,6 +15,9 @@ pub const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 7;
 /// How long a freshly created account may be used to log in.
 pub const PENDING_TTL_SECONDS: i64 = 60 * 60 * 24;
 
+/// How often the janitor looks for the rows that have expired, in seconds.
+pub const DEFAULT_JANITOR_INTERVAL: u64 = 300;
+
 /// Runtime configuration for the panel.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -30,6 +33,9 @@ pub struct Config {
     pub instance_ports: (u16, u16),
     /// Whether the first account to register becomes an admin.
     pub first_user_is_admin: bool,
+    /// How often the janitor throws away the sessions that have expired,
+    /// in seconds.
+    pub janitor_interval: u64,
 }
 
 impl Default for Config {
@@ -41,6 +47,7 @@ impl Default for Config {
             data_dir: default_data_dir().join("instances"),
             instance_ports: DEFAULT_INSTANCE_PORT_RANGE,
             first_user_is_admin: true,
+            janitor_interval: DEFAULT_JANITOR_INTERVAL,
         }
     }
 }
@@ -62,6 +69,12 @@ impl Config {
     /// Read configuration from the environment, falling back to defaults.
     pub fn from_env() -> Config {
         let mut config = Config::default();
+
+        if let Ok(interval) = std::env::var("NOOBS_PANEL_JANITOR_INTERVAL") {
+            if let Ok(parsed) = interval.parse::<u64>() {
+                config.janitor_interval = parsed.max(1);
+            }
+        }
 
         if let Ok(host) = std::env::var("NOOBS_PANEL_HOST") {
             if let Ok(parsed) = host.parse::<IpAddr>() {

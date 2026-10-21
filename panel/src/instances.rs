@@ -11,6 +11,7 @@
 //! it has used too much, which is what a limit of a percentage means.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,9 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The longest an instance may be paused in one go.
 const MAX_PAUSE: Duration = Duration::from_secs(5);
+
+/// How often the size of the directory of an instance is measured.
+const DISK_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The number of samples the share of the processor is worked out over.
 ///
@@ -80,6 +84,8 @@ pub struct LiveUsage {
     pub memory_kb: u64,
     /// Share of the processor in use, in percent.
     pub cpu_percent: u64,
+    /// Disk space used by the instance, in kilobytes.
+    pub disk_kb: u64,
     /// Whether the instance is paused because it used too much processor
     /// time.
     pub throttled: bool,
@@ -223,6 +229,7 @@ impl InstanceManager {
             instance.id,
             child.id() as i32,
             limits.cpu_percent,
+            work_dir.clone(),
             stop.clone(),
             self.usage.clone(),
         );
@@ -290,8 +297,14 @@ impl InstanceManager {
     /// The resources an instance is using right now.
     ///
     /// The watcher of the instance keeps this up to date, so the number is
-    /// the one the instance had a moment ago. An instance that the panel
-    /// does not watch is measured here and now.
+    /// the one the instance had a moment ago. This never waits, because a
+    /// request that waits holds up every other request.
+    ///
+    /// An instance that the panel does not watch, for example one that was
+    /// left behind by an earlier run of the panel, is measured from what
+    /// the kernel knows about it. The share of the processor is then the
+    /// average since the process was started, because measuring it over a
+    /// moment would mean waiting.
     pub fn usage(&self, instance: &Instance) -> Usage {
         let mut usage = Usage::default();
         let Some(pid) = self.live_pid(instance) else {
@@ -301,12 +314,12 @@ impl InstanceManager {
         if let Some(live) = self.usage.lock().unwrap().get(&instance.id) {
             usage.memory_kb = live.memory_kb;
             usage.cpu_percent = live.cpu_percent;
-            usage.disk_kb = 0;
+            usage.disk_kb = live.disk_kb;
             return usage;
         }
 
         usage.memory_kb = resident_memory(pid);
-        usage.cpu_percent = measure_cpu_percent(pid);
+        usage.cpu_percent = average_cpu_percent(pid);
         usage
     }
 
@@ -379,6 +392,7 @@ fn watch(
     id: i64,
     pid: i32,
     cpu_percent: i64,
+    work_dir: PathBuf,
     stop: Arc<AtomicBool>,
     manager: Arc<Mutex<HashMap<i64, LiveUsage>>>,
 ) -> std::thread::JoinHandle<()> {
@@ -395,6 +409,9 @@ fn watch(
         // is worked out over them, so a pause counts as the time it takes,
         // and the instance is not allowed to burst for a long time.
         let mut samples: VecDeque<(f64, f64)> = VecDeque::new();
+
+        // The moment the size of the directory was measured last.
+        let mut last_disk: Option<Instant> = None;
 
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(WATCH_INTERVAL);
@@ -447,6 +464,14 @@ fn watch(
             };
             used.memory_kb = resident_memory(pid);
 
+            // The size of the directory is measured here and not in the
+            // request, because walking a directory with many files in it
+            // takes a moment and a request may not wait.
+            if last_disk.is_none_or(|when| when.elapsed() >= DISK_SAMPLE_INTERVAL) {
+                last_disk = Some(Instant::now());
+                used.disk_kb = directory_size(&work_dir) / 1024;
+            }
+
             manager.lock().unwrap().insert(id, used.clone());
         }
 
@@ -496,20 +521,43 @@ fn process_start_time(pid: i32) -> u64 {
         .unwrap_or(0)
 }
 
-/// The share of the processor a process is using, in percent.
+/// The share of the processor a process is using, in percent, since it was
+/// started.
 ///
-/// The processor time is measured twice, a moment apart, so the share is
-/// the one the process really has.
-fn measure_cpu_percent(pid: i32) -> u64 {
-    let first = cpu_time(pid);
-    let start = Instant::now();
-    std::thread::sleep(WATCH_INTERVAL);
-    let second = cpu_time(pid);
-    let wall = start.elapsed().as_secs_f64();
-    if wall <= 0.0 {
+/// The kernel knows how much processor time a process has used and how long
+/// ago it was started, so the share can be worked out without waiting.
+fn average_cpu_percent(pid: i32) -> u64 {
+    let started = process_start_time(pid);
+    if started == 0 {
         return 0;
     }
-    (((second - first).max(0.0) / wall) * 100.0).round() as u64
+
+    let uptime = uptime_seconds();
+    if uptime <= 0.0 {
+        return 0;
+    }
+
+    // The start time of the process is in clock ticks since the machine
+    // was started.
+    let age = uptime - started as f64 / CLOCK_TICKS_PER_SECOND;
+    if age <= 0.0 {
+        return 0;
+    }
+
+    let share = cpu_time(pid) / age * 100.0;
+    share.round().clamp(0.0, 999.0) as u64
+}
+
+/// How long the machine has been up, in seconds.
+fn uptime_seconds() -> f64 {
+    let Ok(uptime) = std::fs::read_to_string("/proc/uptime") else {
+        return 0.0;
+    };
+    uptime
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0)
 }
 
 /// The processor time a process has used, in seconds.
@@ -598,15 +646,17 @@ unsafe fn set_limit(resource: libc::c_int, soft: u64, hard: u64) {
 /// Wait for an instance to report the port it listens on.
 ///
 /// Returns `None` when the instance died before it was ready.
+///
+/// Only the end of the log is read, because the log of an instance can
+/// grow to any size and reading all of it every fifty milliseconds would
+/// cost more than waiting for the instance.
 fn wait_for_port(log_path: &Path, child: &mut Child) -> Option<u16> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if let Ok(output) = std::fs::read_to_string(log_path) {
-            for line in output.lines() {
-                if let Some(rest) = line.trim().strip_prefix("Port:") {
-                    if let Ok(port) = rest.trim().parse::<u16>() {
-                        return Some(port);
-                    }
+        for line in log_tail(log_path).lines() {
+            if let Some(rest) = line.trim().strip_prefix("Port:") {
+                if let Ok(port) = rest.trim().parse::<u16>() {
+                    return Some(port);
                 }
             }
         }
@@ -618,6 +668,35 @@ fn wait_for_port(log_path: &Path, child: &mut Child) -> Option<u16> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     None
+}
+
+/// The last part of a file, as text.
+///
+/// The file is read from the end, so a file of any size costs the same.
+fn log_tail(path: &Path) -> String {
+    const TAIL_BYTES: u64 = 8 * 1024;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    if length == 0 {
+        return String::new();
+    }
+
+    let start = length.saturating_sub(TAIL_BYTES);
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+
+    let mut buffer = Vec::new();
+    if file.read_to_end(&mut buffer).is_err() {
+        return String::new();
+    }
+
+    String::from_utf8_lossy(&buffer).to_string()
 }
 
 /// Whether a process id is alive.

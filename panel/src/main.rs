@@ -7,12 +7,13 @@ use std::sync::Arc;
 use hello_server::port;
 use tiny_http::Server;
 
-use panel::app::{self, App};
+use panel::app::App;
 use panel::config::Config;
 use panel::db::Database;
 use panel::instances::InstanceManager;
+use panel::janitor;
+use panel::pool;
 use panel::presets::Preset;
-use panel::web::WebRequest;
 
 /// Command line options.
 struct Options {
@@ -141,13 +142,13 @@ fn main() -> ExitCode {
 
     let config = options.config;
 
-    let db = match Database::open(&config.database) {
+    let db = Arc::new(match Database::open(&config.database) {
         Ok(db) => db,
         Err(err) => {
             eprintln!("error: cannot open the database: {err}");
             return ExitCode::FAILURE;
         }
-    };
+    });
 
     let manager = Arc::new(InstanceManager::new());
 
@@ -163,6 +164,13 @@ fn main() -> ExitCode {
     let _ = db.prune_sessions(panel::app::now());
     let _ = db.prune_csrf_tokens(panel::app::now());
 
+    // The janitor keeps the tables of the sessions and the csrf tokens
+    // small while the panel runs.
+    let _janitor = janitor::Janitor::start_with_interval(
+        db.clone(),
+        std::time::Duration::from_secs(config.janitor_interval),
+    );
+
     let bound = match port::bind_with_fallback(config.host, config.port) {
         Ok(bound) => bound,
         Err(err) => {
@@ -173,11 +181,11 @@ fn main() -> ExitCode {
 
     let url = port::display_url(config.host, bound.port);
 
-    let app = App {
+    let app = Arc::new(App {
         config: config.clone(),
-        db,
+        db: db.clone(),
         manager: manager.clone(),
-    };
+    });
 
     let is_fallback = bound.is_fallback();
     let requested_port = bound.requested;
@@ -212,10 +220,21 @@ fn main() -> ExitCode {
     println!("  Stop with:  Ctrl+C");
     println!();
 
+    // The requests are answered by a pool of workers, so a slow request
+    // does not hold up the others.
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .clamp(2, 16);
+    let pool = pool::Pool::new(workers, workers * 8);
+    println!("  Workers:    {workers}");
+
     for request in server.incoming_requests() {
-        let request = WebRequest::new(request);
-        let response = app::handle(&app, &request);
-        let _ = request.raw.respond(response);
+        let app = app.clone();
+        if let Err(request) = pool.submit_request(app, request) {
+            // The queue is full, so the panel is too busy.
+            let _ = request.respond(pool::busy());
+        }
     }
 
     // Any instance that is still running is stopped together with the panel.

@@ -100,8 +100,19 @@ pub fn serve_with_root(
         let path = request.url().to_string();
         let method = request.method().clone();
 
+        // The mark the browser has of the file, so the file does not have to
+        // be sent again when nothing changed.
+        let known = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("If-None-Match"))
+            .and_then(|header| std::str::from_utf8(header.value.as_bytes()).ok())
+            .map(|value| value.trim().to_string());
+
         // A file of the site is served when there is one.
-        let served = root.as_ref().and_then(|root| site::serve_file(root, &path));
+        let served = root
+            .as_ref()
+            .and_then(|root| site::serve_file(root, &path, known.as_deref()));
 
         let response: HtmlResponse = if let Some(response) = served {
             response

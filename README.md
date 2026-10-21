@@ -44,6 +44,17 @@ OPTIONS:
 If the requested port is busy, the panel moves to the nearest free one, the
 same way `hello-server` does.
 
+The requests are answered by a pool of workers, one for every core of the
+machine, so a slow request does not hold up the others. The queue of the
+pool has a limit, and a request that arrives when the queue is full is
+answered with `503` right away, so a flood of requests cannot use all the
+memory of the phone. A request that goes wrong does not take the panel
+down: the worker catches it, answers `500`, and goes on with the next one.
+
+Nothing in a request waits for a moment. The usage of the instances is
+measured by the watcher of the instance, and the size of its directory is
+measured every few seconds, so a page is answered as soon as it can be.
+
 ### Environment
 
 | Variable | Meaning |
@@ -52,6 +63,7 @@ same way `hello-server` does.
 | `NOOBS_PANEL_HOST` | Same as `--host` |
 | `NOOBS_PANEL_DATA` | Same as `--data-dir` |
 | `NOOBS_PANEL_INSTANCE_PORTS` | Port range for instances, as `START-END` |
+| `NOOBS_PANEL_JANITOR_INTERVAL` | How often the expired sessions are thrown away, in seconds [default: 300] |
 | `NOOBS_INSTANCE_BIN` | Path of the `hello-server` binary |
 | `NOOBS_BENCHMARKER_BIN` | Path of the `benchmarker` binary |
 
@@ -172,6 +184,11 @@ as much as it can, and the test measures the share of the core the instance
 was given. The memory of the benchmarker is checked as well, because the
 panel has to show the instance using it.
 
+The panel is tested with many requests at the same time, and with a page
+that takes a moment, to be sure that a slow request does not hold up the
+others. The janitor of the panel is tested as well, and really throws the
+sessions that have expired away.
+
 ## Layout
 
 | Path | Contents |
@@ -182,6 +199,8 @@ panel has to show the instance using it.
 | `panel/src/config.rs` | Configuration |
 | `panel/src/db.rs` | SQLite storage |
 | `panel/src/instances.rs` | Starting, stopping and limiting instances |
+| `panel/src/janitor.rs` | Throwing away the sessions that have expired |
+| `panel/src/pool.rs` | The workers that answer the requests |
 | `panel/src/presets.rs` | The kinds of workload an instance can run |
 | `panel/src/models.rs` | Users, instances and their types |
 | `panel/src/views.rs` | The HTML pages |

@@ -1,6 +1,7 @@
 //! SQLite storage for accounts, sessions and instances.
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -40,8 +41,28 @@ impl From<rusqlite::Error> for DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Handle to the panel database.
+///
+/// The connection is behind a mutex, so the database can be used by the
+/// workers of the panel at the same time. A SQLite connection is `Send` but
+/// not `Sync`, so the mutex is what makes it shareable.
 pub struct Database {
-    conn: Connection,
+    conn: Mutex<Connection>,
+}
+
+/// Set the connection up for the way the panel uses it.
+///
+/// The panel reads and writes from more than one thread, so a busy database
+/// has to wait a moment instead of giving up at once. The journal is kept
+/// in the write ahead log, which lets a reader and a writer work at the
+/// same time, and `NORMAL` is the setting that goes with it: a write is on
+/// disk when the write ahead log is, which is enough for a panel that can
+/// be started again.
+fn prepare(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
 }
 
 impl Database {
@@ -52,9 +73,10 @@ impl Database {
                 .map_err(|err| DbError::Conflict(format!("cannot create data directory: {err}")))?;
         }
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Database { conn };
+        prepare(&conn)?;
+        let db = Database {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -62,15 +84,27 @@ impl Database {
     /// Open an in-memory database, used by the tests.
     pub fn open_in_memory() -> Result<Database> {
         let conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Database { conn };
+        prepare(&conn)?;
+        let db = Database {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
 
+    /// The connection, locked for the time of the call.
+    ///
+    /// A lock that was poisoned by a panic is taken anyway, because the
+    /// database is still usable and one broken request should not take the
+    /// whole panel down.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     /// Create the schema if it is not there yet.
     fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
+        let conn = self.conn();
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS users (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,9 +156,20 @@ impl Database {
 
         // The tables above are only made when they are not there yet, so a
         // table from an earlier version is brought up to date by hand.
-        self.add_column_if_missing("instances", "preset", "TEXT NOT NULL DEFAULT 'hello-world'")?;
-        self.add_column_if_missing("users", "cpu_limit_percent", "INTEGER NOT NULL DEFAULT 200")?;
-        self.add_column_if_missing(
+        add_column_if_missing(
+            &conn,
+            "instances",
+            "preset",
+            "TEXT NOT NULL DEFAULT 'hello-world'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "users",
+            "cpu_limit_percent",
+            "INTEGER NOT NULL DEFAULT 200",
+        )?;
+        add_column_if_missing(
+            &conn,
             "instances",
             "cpu_limit_percent",
             "INTEGER NOT NULL DEFAULT 50",
@@ -133,26 +178,11 @@ impl Database {
         Ok(())
     }
 
-    /// Add a column to a table, unless the table already has it.
-    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
-        let found = self.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-            params![table, column],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if found == 0 {
-            self.conn.execute_batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-            ))?;
-        }
-        Ok(())
-    }
-
     /// The number of registered accounts.
     pub fn user_count(&self) -> Result<i64> {
-        let count = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?;
+        let conn = self.conn();
+
+        let count = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?;
         Ok(count)
     }
 
@@ -165,18 +195,21 @@ impl Database {
         role: Role,
         created_at: i64,
     ) -> Result<i64> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "INSERT INTO users (username, email, password_hash, role, is_active, created_at)
              VALUES (?1, ?2, ?3, ?4, 1, ?5)",
             params![username, email, password_hash, role.as_db(), created_at],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Look up an account by login name.
     pub fn user_by_username(&self, username: &str) -> Result<Option<User>> {
-        let user = self
-            .conn
+        let conn = self.conn();
+
+        let user = conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
                         memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
@@ -190,8 +223,9 @@ impl Database {
 
     /// Look up an account by id.
     pub fn user_by_id(&self, id: i64) -> Result<Option<User>> {
-        let user = self
-            .conn
+        let conn = self.conn();
+
+        let user = conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
                         memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
@@ -205,8 +239,9 @@ impl Database {
 
     /// Look up an account by email address.
     pub fn user_by_email(&self, email: &str) -> Result<Option<User>> {
-        let user = self
-            .conn
+        let conn = self.conn();
+
+        let user = conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
                         memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
@@ -220,8 +255,9 @@ impl Database {
 
     /// The stored password hash of an account, used to verify a sign in.
     pub fn password_hash(&self, username: &str) -> Result<Option<String>> {
-        let hash = self
-            .conn
+        let conn = self.conn();
+
+        let hash = conn
             .query_row(
                 "SELECT password_hash FROM users WHERE username = ?1",
                 params![username],
@@ -233,7 +269,9 @@ impl Database {
 
     /// Every account, oldest first.
     pub fn all_users(&self) -> Result<Vec<User>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+
+        let mut stmt = conn.prepare(
             "SELECT id, username, email, role, is_active, created_at,
                     memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
              FROM users ORDER BY id",
@@ -246,7 +284,9 @@ impl Database {
 
     /// Change the role of an account.
     pub fn set_role(&self, user_id: i64, role: Role) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE users SET role = ?1 WHERE id = ?2",
             params![role.as_db(), user_id],
         )?;
@@ -255,7 +295,9 @@ impl Database {
 
     /// Enable or disable an account.
     pub fn set_active(&self, user_id: i64, active: bool) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE users SET is_active = ?1 WHERE id = ?2",
             params![active as i64, user_id],
         )?;
@@ -264,7 +306,9 @@ impl Database {
 
     /// Change the password of an account.
     pub fn set_password(&self, user_id: i64, password_hash: &str) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE users SET password_hash = ?1 WHERE id = ?2",
             params![password_hash, user_id],
         )?;
@@ -280,7 +324,9 @@ impl Database {
         disk_mb: i64,
         instance_limit: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE users
              SET memory_limit_mb = ?1, cpu_limit_percent = ?2, disk_limit_mb = ?3, instance_limit = ?4
              WHERE id = ?5",
@@ -291,8 +337,9 @@ impl Database {
 
     /// Delete an account and everything that belongs to it.
     pub fn delete_user(&self, user_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        let conn = self.conn();
+
+        conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -305,7 +352,9 @@ impl Database {
         created_at: i64,
         expires_at: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "INSERT INTO sessions (token, user_id, csrf_token, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![token, user_id, csrf_token, created_at, expires_at],
@@ -315,8 +364,9 @@ impl Database {
 
     /// The user id and csrf token of a session, if it exists and is valid.
     pub fn session_user(&self, token: &str, now: i64) -> Result<Option<(i64, String)>> {
-        let session = self
-            .conn
+        let conn = self.conn();
+
+        let session = conn
             .query_row(
                 "SELECT user_id, csrf_token FROM sessions WHERE token = ?1 AND expires_at > ?2",
                 params![token, now],
@@ -328,23 +378,26 @@ impl Database {
 
     /// Remove a session.
     pub fn delete_session(&self, token: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
+        let conn = self.conn();
+
+        conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
         Ok(())
     }
 
     /// Remove every session that has expired.
     pub fn prune_sessions(&self, now: i64) -> Result<usize> {
-        let removed = self
-            .conn
-            .execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
+        let conn = self.conn();
+
+        let removed = conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
         Ok(removed)
     }
 
     /// Remember a csrf token that was handed out for a form that is shown
     /// before signing in.
     pub fn save_csrf_token(&self, token: &str, created_at: i64, expires_at: i64) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "INSERT OR REPLACE INTO csrf_tokens (token, created_at, expires_at)
              VALUES (?1, ?2, ?3)",
             params![token, created_at, expires_at],
@@ -357,8 +410,9 @@ impl Database {
     /// The token is kept on the server, so a cookie that was put in the
     /// browser by somebody else is not enough to pass the check.
     pub fn csrf_token_is_valid(&self, token: &str, now: i64) -> Result<bool> {
-        let found = self
-            .conn
+        let conn = self.conn();
+
+        let found = conn
             .query_row(
                 "SELECT 1 FROM csrf_tokens WHERE token = ?1 AND expires_at > ?2",
                 params![token, now],
@@ -370,7 +424,9 @@ impl Database {
 
     /// Remove every csrf token that has expired.
     pub fn prune_csrf_tokens(&self, now: i64) -> Result<usize> {
-        let removed = self.conn.execute(
+        let conn = self.conn();
+
+        let removed = conn.execute(
             "DELETE FROM csrf_tokens WHERE expires_at <= ?1",
             params![now],
         )?;
@@ -391,7 +447,9 @@ impl Database {
         preset: &str,
         created_at: i64,
     ) -> Result<i64> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "INSERT INTO instances
                  (name, owner_id, port, state, memory_limit_mb, cpu_limit_percent,
                   disk_limit_mb, preset, created_at)
@@ -407,12 +465,14 @@ impl Database {
                 created_at
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Hand an instance to another account.
     pub fn set_instance_owner(&self, id: i64, owner_id: i64) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE instances SET owner_id = ?1 WHERE id = ?2",
             params![owner_id, id],
         )?;
@@ -421,8 +481,9 @@ impl Database {
 
     /// Look up an instance by id.
     pub fn instance_by_id(&self, id: i64) -> Result<Option<Instance>> {
-        let instance = self
-            .conn
+        let conn = self.conn();
+
+        let instance = conn
             .query_row(
                 "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
                         i.memory_limit_mb, i.cpu_limit_percent, i.disk_limit_mb,
@@ -437,23 +498,51 @@ impl Database {
     }
 
     /// Every instance, optionally filtered by owner.
+    ///
+    /// The filter is done by the database, so the index on the owner is
+    /// used and only the rows that are wanted are read.
     pub fn list_instances(&self, owner_id: Option<i64>) -> Result<Vec<Instance>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
-                    i.memory_limit_mb, i.cpu_limit_percent, i.disk_limit_mb,
-                    i.created_at, i.exit_code, i.preset
-             FROM instances i JOIN users u ON u.id = i.owner_id
-             ORDER BY i.id",
-        )?;
-        let rows = stmt.query_map([], map_instance)?;
+        let conn = self.conn();
         let mut instances = Vec::new();
-        for instance in rows {
-            let instance = instance?;
-            if owner_id.is_none_or(|owner| owner == instance.owner_id) {
-                instances.push(instance);
+
+        match owner_id {
+            Some(owner) => {
+                let sql = format!(
+                    "SELECT {INSTANCE_COLUMNS}
+                     FROM instances i JOIN users u ON u.id = i.owner_id
+                     WHERE i.owner_id = ?1 ORDER BY i.id"
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let rows = stmt.query_map(params![owner], map_instance)?;
+                for instance in rows {
+                    instances.push(instance?);
+                }
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {INSTANCE_COLUMNS}
+                     FROM instances i JOIN users u ON u.id = i.owner_id
+                     ORDER BY i.id"
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let rows = stmt.query_map([], map_instance)?;
+                for instance in rows {
+                    instances.push(instance?);
+                }
             }
         }
+
         Ok(instances)
+    }
+
+    /// The number of accounts with the administrator role.
+    pub fn admin_count(&self) -> Result<i64> {
+        let count = conn_count(
+            &self.conn(),
+            "SELECT COUNT(*) FROM users WHERE role = ?1",
+            params![Role::Admin.as_db()],
+        )?;
+        Ok(count)
     }
 
     /// Update the runtime state of an instance.
@@ -464,7 +553,9 @@ impl Database {
         pid: Option<i32>,
         exit_code: Option<i32>,
     ) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE instances SET state = ?1, pid = ?2, exit_code = ?3 WHERE id = ?4",
             params![state.as_db(), pid, exit_code, id],
         )?;
@@ -476,7 +567,9 @@ impl Database {
     /// An instance moves to another port when the one it was given is busy,
     /// so the port it ended up on has to be recorded.
     pub fn set_instance_port(&self, id: i64, port: u16) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE instances SET port = ?1 WHERE id = ?2",
             params![port, id],
         )?;
@@ -491,7 +584,9 @@ impl Database {
         cpu_limit_percent: i64,
         disk_limit_mb: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+
+        conn.execute(
             "UPDATE instances SET memory_limit_mb = ?1, cpu_limit_percent = ?2, disk_limit_mb = ?3
              WHERE id = ?4",
             params![memory_limit_mb, cpu_limit_percent, disk_limit_mb, id],
@@ -501,11 +596,43 @@ impl Database {
 
     /// Delete an instance record.
     pub fn delete_instance(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM instances WHERE id = ?1", params![id])?;
+        let conn = self.conn();
+
+        conn.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
         Ok(())
     }
 }
+
+/// Add a column to a table, unless the table already has it.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let found = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if found == 0 {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Count the rows a query matches.
+fn conn_count(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<i64> {
+    let count = conn.query_row(sql, params, |row| row.get::<_, i64>(0))?;
+    Ok(count)
+}
+
+/// The columns of an instance, with the name of its owner.
+const INSTANCE_COLUMNS: &str = "i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
+        i.memory_limit_mb, i.cpu_limit_percent, i.disk_limit_mb,
+        i.created_at, i.exit_code, i.preset";
 
 /// Map a user row.
 fn map_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
