@@ -95,6 +95,12 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 
+            CREATE TABLE IF NOT EXISTS csrf_tokens (
+                token      TEXT    PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS instances (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 name              TEXT    NOT NULL UNIQUE,
@@ -305,6 +311,42 @@ impl Database {
         let removed = self
             .conn
             .execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
+        Ok(removed)
+    }
+
+    /// Remember a csrf token that was handed out for a form that is shown
+    /// before signing in.
+    pub fn save_csrf_token(&self, token: &str, created_at: i64, expires_at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO csrf_tokens (token, created_at, expires_at)
+             VALUES (?1, ?2, ?3)",
+            params![token, created_at, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a csrf token is one the panel handed out and is still valid.
+    ///
+    /// The token is kept on the server, so a cookie that was put in the
+    /// browser by somebody else is not enough to pass the check.
+    pub fn csrf_token_is_valid(&self, token: &str, now: i64) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM csrf_tokens WHERE token = ?1 AND expires_at > ?2",
+                params![token, now],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Remove every csrf token that has expired.
+    pub fn prune_csrf_tokens(&self, now: i64) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM csrf_tokens WHERE expires_at <= ?1",
+            params![now],
+        )?;
         Ok(removed)
     }
 

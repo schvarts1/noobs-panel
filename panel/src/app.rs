@@ -129,6 +129,45 @@ fn check_csrf(identity: &Identity, request: &WebRequest) -> Result<(), Response>
     Ok(())
 }
 
+/// Hand out a new csrf token and remember it.
+fn issue_csrf(app: &App) -> String {
+    let token = auth::generate_csrf_token();
+    let _ = app
+        .db
+        .save_csrf_token(&token, now(), now() + crate::config::SESSION_TTL_SECONDS);
+    token
+}
+
+/// The csrf token of a form that is shown before signing in.
+///
+/// A token that the panel handed out before is reused, so that a page that
+/// was opened earlier still matches the cookie. A form therefore keeps
+/// working when the page was reloaded, when it was opened in a second tab,
+/// or when the back button was used. A token that the panel does not know
+/// is replaced by a fresh one.
+fn anonymous_csrf(app: &App, request: &WebRequest) -> String {
+    if let Some(token) = request.cookie(auth::CSRF_COOKIE) {
+        if auth::is_csrf_token(token) && app.db.csrf_token_is_valid(token, now()).unwrap_or(false) {
+            return token.to_string();
+        }
+    }
+    issue_csrf(app)
+}
+
+/// Check the csrf token of a form that was shown before signing in.
+///
+/// The cookie and the form have to carry the same token, and the panel has
+/// to know the token, so a cookie that was put in the browser by somebody
+/// else is not enough.
+fn check_form_csrf(app: &App, request: &WebRequest) -> bool {
+    let expected = request.cookie(auth::CSRF_COOKIE).unwrap_or_default();
+    let provided = request.trimmed_field("_csrf");
+    if !auth::csrf_matches(expected, &provided) {
+        return false;
+    }
+    app.db.csrf_token_is_valid(expected, now()).unwrap_or(false)
+}
+
 /// The page with the sign in form.
 fn login_page(app: &App, request: &WebRequest) -> Response {
     // A user who is already signed in has no use for the login form.
@@ -137,7 +176,7 @@ fn login_page(app: &App, request: &WebRequest) -> Response {
     }
     // A csrf token is issued in a cookie and repeated in the form, so the
     // form cannot be submitted from another site.
-    let csrf = auth::generate_csrf_token();
+    let csrf = anonymous_csrf(app, request);
     let body = views::login_page(&csrf, None);
     web::html_with_cookie(
         200,
@@ -149,22 +188,31 @@ fn login_page(app: &App, request: &WebRequest) -> Response {
     )
 }
 
-/// Check the csrf token of a form that was shown before signing in.
-fn check_form_csrf(request: &WebRequest) -> bool {
-    let expected = request.cookie(auth::CSRF_COOKIE).unwrap_or_default();
-    let provided = request.trimmed_field("_csrf");
-    auth::csrf_matches(expected, &provided)
+/// The sign in page with an error, which can be submitted again.
+///
+/// The token the browser already has is used, so the form and the cookie
+/// agree and the user can simply press the button again instead of being
+/// stuck with a form that cannot be submitted.
+fn login_page_again(app: &App, request: &WebRequest, error: &str) -> Response {
+    let csrf = anonymous_csrf(app, request);
+    let body = views::login_page(&csrf, Some(error));
+    web::html_with_cookie(
+        200,
+        body,
+        auth::CSRF_COOKIE,
+        &csrf,
+        crate::config::SESSION_TTL_SECONDS,
+        true,
+    )
 }
 
 /// Handle the sign in form.
 fn login_submit(app: &App, request: &WebRequest) -> Response {
-    if !check_form_csrf(request) {
-        return web::html(
-            200,
-            views::login_page(
-                "",
-                Some("The form was not submitted correctly. Please try again."),
-            ),
+    if !check_form_csrf(app, request) {
+        return login_page_again(
+            app,
+            request,
+            "The form was not submitted correctly. Please try again.",
         );
     }
 
@@ -173,36 +221,20 @@ fn login_submit(app: &App, request: &WebRequest) -> Response {
 
     let stored = match app.db.password_hash(&username) {
         Ok(Some(hash)) => hash,
-        _ => {
-            return web::html(
-                200,
-                views::login_page("", Some("Wrong username or password.")),
-            )
-        }
+        _ => return login_page_again(app, request, "Wrong username or password."),
     };
 
     if !auth::verify_password(&password, &stored) {
-        return web::html(
-            200,
-            views::login_page("", Some("Wrong username or password.")),
-        );
+        return login_page_again(app, request, "Wrong username or password.");
     }
 
     let user = match app.db.user_by_username(&username) {
         Ok(Some(user)) => user,
-        _ => {
-            return web::html(
-                200,
-                views::login_page("", Some("Wrong username or password.")),
-            )
-        }
+        _ => return login_page_again(app, request, "Wrong username or password."),
     };
 
     if !user.is_active {
-        return web::html(
-            200,
-            views::login_page("", Some("This account has been disabled.")),
-        );
+        return login_page_again(app, request, "This account has been disabled.");
     }
 
     let session =
@@ -232,8 +264,26 @@ fn signup_page(app: &App, request: &WebRequest) -> Response {
     if identity(app, request).is_some() {
         return web::redirect("/dashboard");
     }
-    let csrf = auth::generate_csrf_token();
+    let csrf = anonymous_csrf(app, request);
     let body = views::signup_page(&csrf, None);
+    web::html_with_cookie(
+        200,
+        body,
+        auth::CSRF_COOKIE,
+        &csrf,
+        crate::config::SESSION_TTL_SECONDS,
+        true,
+    )
+}
+
+/// The registration page with an error, which can be submitted again.
+///
+/// The token the browser already has is used, so the form and the cookie
+/// agree and the user can simply press the button again instead of being
+/// stuck with a form that cannot be submitted.
+fn signup_page_again(app: &App, request: &WebRequest, error: &str) -> Response {
+    let csrf = anonymous_csrf(app, request);
+    let body = views::signup_page(&csrf, Some(error));
     web::html_with_cookie(
         200,
         body,
@@ -246,13 +296,11 @@ fn signup_page(app: &App, request: &WebRequest) -> Response {
 
 /// Handle the registration form.
 fn signup_submit(app: &App, request: &WebRequest) -> Response {
-    if !check_form_csrf(request) {
-        return web::html(
-            200,
-            views::signup_page(
-                "",
-                Some("The form was not submitted correctly. Please try again."),
-            ),
+    if !check_form_csrf(app, request) {
+        return signup_page_again(
+            app,
+            request,
+            "The form was not submitted correctly. Please try again.",
         );
     }
 
@@ -261,26 +309,20 @@ fn signup_submit(app: &App, request: &WebRequest) -> Response {
     let password = request.field("password").unwrap_or_default().to_string();
 
     if let Err(message) = auth::validate_username(&username) {
-        return web::html(200, views::signup_page("", Some(&message)));
+        return signup_page_again(app, request, &message);
     }
     if let Err(message) = auth::validate_email(&email) {
-        return web::html(200, views::signup_page("", Some(&message)));
+        return signup_page_again(app, request, &message);
     }
     if let Err(message) = auth::validate_password(&password) {
-        return web::html(200, views::signup_page("", Some(&message)));
+        return signup_page_again(app, request, &message);
     }
 
     if let Ok(Some(_)) = app.db.user_by_username(&username) {
-        return web::html(
-            200,
-            views::signup_page("", Some("That username is already taken.")),
-        );
+        return signup_page_again(app, request, "That username is already taken.");
     }
     if let Ok(Some(_)) = app.db.user_by_email(&email) {
-        return web::html(
-            200,
-            views::signup_page("", Some("That email address is already registered.")),
-        );
+        return signup_page_again(app, request, "That email address is already registered.");
     }
 
     // The very first account on a fresh panel becomes an administrator, so

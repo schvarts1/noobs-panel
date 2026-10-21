@@ -24,6 +24,14 @@ pub fn generate_csrf_token() -> String {
     random_token(32)
 }
 
+/// Whether a string has the shape of a csrf token.
+///
+/// The check keeps a request with a nonsense cookie from reaching the
+/// database.
+pub fn is_csrf_token(token: &str) -> bool {
+    token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Hash a password with Argon2id.
 pub fn hash_password(password: &str) -> Result<String> {
     let hash = Argon2::default()

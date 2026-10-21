@@ -158,6 +158,10 @@ fn main() -> ExitCode {
         }
     }
 
+    // Sessions and csrf tokens that have expired are of no use any more.
+    let _ = db.prune_sessions(panel::app::now());
+    let _ = db.prune_csrf_tokens(panel::app::now());
+
     let bound = match port::bind_with_fallback(config.host, config.port) {
         Ok(bound) => bound,
         Err(err) => {

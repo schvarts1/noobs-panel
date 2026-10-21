@@ -606,3 +606,94 @@ fn extract_port(html: &str) -> u16 {
         + start;
     html[start..end].parse().expect("port is not a number")
 }
+
+#[test]
+fn a_form_still_works_when_a_second_page_was_opened() {
+    let panel = start_panel();
+    let mut client = Client::new(panel.port);
+
+    // The registration form is opened twice, as it happens when the page is
+    // reloaded or opened in a second tab.
+    let first = client.csrf("/signup");
+    let second = client.csrf("/signup");
+    assert_eq!(first, second, "the form should use the same token");
+
+    let reply = client.post(
+        "/signup",
+        &format!("_csrf={first}&username=alice&email=alice@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 303);
+}
+
+#[test]
+fn the_form_can_be_submitted_again_after_a_failed_attempt() {
+    let panel = start_panel();
+    let mut client = Client::new(panel.port);
+
+    // A token the panel does not know is refused.
+    let reply = client.post(
+        "/signup",
+        "_csrf=deadbeef&username=alice&email=alice@example.com&password=supersecret1",
+    );
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("not submitted correctly"));
+
+    // The page that came back has to carry a token that works, so the user
+    // can simply press the button again.
+    let token = extract_csrf(&reply.body);
+    let reply = client.post(
+        "/signup",
+        &format!("_csrf={token}&username=alice&email=alice@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 303);
+}
+
+#[test]
+fn the_form_keeps_working_after_an_ordinary_error() {
+    let panel = start_panel();
+    let mut client = Client::new(panel.port);
+
+    // The first account is registered.
+    let token = client.csrf("/signup");
+    let reply = client.post(
+        "/signup",
+        &format!("_csrf={token}&username=alice&email=alice@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 303);
+
+    // A second client tries to use the same name.
+    let mut other = Client::new(panel.port);
+    let token = other.csrf("/signup");
+    let reply = other.post(
+        "/signup",
+        &format!("_csrf={token}&username=alice&email=other@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("already taken"));
+
+    // The form that came back has to work, so a different name can be used.
+    let token = extract_csrf(&reply.body);
+    let reply = other.post(
+        "/signup",
+        &format!("_csrf={token}&username=bob&email=bob@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 303);
+}
+
+#[test]
+fn a_forged_csrf_cookie_is_refused() {
+    let panel = start_panel();
+    let mut client = Client::new(panel.port);
+
+    // A cookie that was put in the browser by somebody else, with a token
+    // that looks like one of ours.
+    let forged = "ab".repeat(32);
+    client.csrf_cookie = Some(format!("noobs_csrf={forged}"));
+
+    let reply = client.post(
+        "/signup",
+        &format!("_csrf={forged}&username=alice&email=alice@example.com&password=supersecret1"),
+    );
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("not submitted correctly"));
+}
