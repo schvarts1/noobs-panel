@@ -62,7 +62,27 @@ admin area is used to promote accounts, disable them, reset passwords and
 change the resource limits that are granted to them.
 
 Administrators see every instance and can manage any of them. Regular users
-only see and manage their own.
+only see and manage their own. The page `/instances` shows every instance of
+the machine to an administrator, with the account it belongs to and what it
+is using.
+
+### Sites
+
+The **Hello World** and **My site** presets serve the files that are in the
+directory of the instance. The user of the instance writes them in the
+editor on `/instances/<id>/site`, which holds three files:
+
+| File | What it holds |
+| ---- | ------------- |
+| `index.html` | The page of the site |
+| `style.css` | The style of the site |
+| `app.js` | The script of the site |
+
+The editor writes the files straight to the directory of the instance, and
+the instance serves them on the next request, so a change is live at once
+and does not need a restart. A **My site** instance starts with a small
+example, a **Hello World** instance keeps its own page until the user
+writes one.
 
 ### Instances
 
@@ -73,12 +93,13 @@ page of the instance or from the admin area. A regular user can start, stop
 and delete the instances that belong to them, but cannot create new ones or
 take them away.
 
-An instance runs a preset. There are two of them:
+An instance runs a preset. There are three of them:
 
 | Preset | What it does |
 | ------ | ------------ |
 | **Hello World** | A small web server that greets every visitor. Use it to see that an instance runs and answers. |
 | **Benchmarker** | A web server that uses as much memory, processor time and disk as it can, so the limits of the instance can be checked. |
+| **My site** | An empty website. The user of the instance writes the html, the style and the script of it themselves, in the editor of the instance. |
 
 The benchmarker serves a page that shows how much of the granted resources
 is in use, and it can be asked to push against the limits:
@@ -86,35 +107,48 @@ is in use, and it can be asked to push against the limits:
 | Address | What it does |
 | ------- | ------------ |
 | `/` | The page with the usage and the limits the kernel gave the process |
-| `/stress/memory` | Takes as much memory as it can, until the kernel refuses |
+| `/stress/memory` | Takes as much memory as it can, until the kernel refuses. The memory is kept, so the dashboard shows the instance using it. |
 | `/stress/disk` | Writes a file until the kernel refuses |
-| `/stress/cpu` | Uses the processor until the kernel stops the instance |
+| `/stress/cpu` | Uses the processor as much as it can. The panel holds the instance to its share of the processor. |
 
-The processor test ends the instance on purpose, because that is the only
-way to see that the limit is real. The panel then shows the instance as
-stopped, and the log of the instance says what happened.
+The processor test keeps the instance busy in the background, so the page of
+the benchmarker still answers and the dashboard shows what the instance is
+using. The memory test holds on to the memory it took, so the spike stays
+visible on the dashboard instead of vanishing right away.
 
 Creating an instance asks for a name and three limits:
 
 | Limit | Meaning |
 | ----- | ------- |
 | Memory | How much memory the instance may use, in megabytes |
-| CPU time | How much processor time the instance may consume, in seconds |
+| CPU | How much of a processor the instance may use, in percent. One instance may use at most one core, so the highest value is a hundred percent. |
 | Disk | How large a file the instance may write, in megabytes |
+
+The processor limit of an account is the sum of the shares of the instances
+it holds, so an account with a limit of two hundred percent may hold four
+instances of fifty percent, or two of a hundred percent.
 
 The limits of an instance are drawn from the limits of its owner, so an
 account can never hand out more than it has. The panel refuses a request
 that would exceed the quota of the account.
 
-The limits are enforced by the kernel with `setrlimit`, so they hold even if
-the instance misbehaves:
+The memory and the disk limits are enforced by the kernel with `setrlimit`,
+so they hold even if the instance misbehaves:
 
 - `RLIMIT_DATA` caps the memory of the process
-- `RLIMIT_CPU` caps the processor time
 - `RLIMIT_FSIZE` caps the size of a written file
 
+The processor limit cannot be done by the kernel, because the kernel only
+knows processor time and not the share of a processor. The panel watches
+every instance and pauses it for a while with `SIGSTOP` when it uses more
+of the processor than it may, and lets it run again with `SIGCONT` when it
+has earned the time back. `RLIMIT_CPU` is set as well, as a backstop of one
+day for a process that ignores the pauses.
+
 The panel reads the live usage of an instance from `/proc`, and shows it on
-the page of the instance.
+the page of the instance. The dashboard asks the panel for the usage of the
+instances every two seconds, so the numbers on the page are the ones of
+right now.
 
 > On Android the memory limit uses `RLIMIT_DATA` rather than `RLIMIT_AS`,
 > because the dynamic linker reserves a very large shadow memory region and
@@ -133,11 +167,17 @@ an instance, which is really started and really serves a request. The
 benchmarker is tested as well, and it really runs into the limits it is
 given.
 
+The processor limit is checked for real: the benchmarker uses the processor
+as much as it can, and the test measures the share of the core the instance
+was given. The memory of the benchmarker is checked as well, because the
+panel has to show the instance using it.
+
 ## Layout
 
 | Path | Contents |
 | ---- | -------- |
 | `panel/src/app.rs` | Routing and request handling |
+| `panel/src/site.rs` | The files of the site of an instance |
 | `panel/src/auth.rs` | Password hashing, sessions, csrf |
 | `panel/src/config.rs` | Configuration |
 | `panel/src/db.rs` | SQLite storage |

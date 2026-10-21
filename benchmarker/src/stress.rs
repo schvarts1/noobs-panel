@@ -4,6 +4,7 @@
 //! checked from the outside.
 
 use std::ffi::CString;
+use std::sync::Mutex;
 
 /// The message the process prints when the kernel stops it for using too
 /// much processor time.
@@ -13,41 +14,51 @@ use std::ffi::CString;
 const CPU_LIMIT_MESSAGE: &[u8] =
     b"\n  the cpu limit was reached, the kernel stopped this process\n";
 
+/// The memory that was taken and is held, so the usage stays visible.
+///
+/// The blocks are kept until the process ends, because the point of the
+/// test is that the usage of the instance can be seen while it is high.
+static HELD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// Take as much memory as the limits allow.
 ///
 /// The memory is taken with `malloc` instead of the Rust allocator, because
 /// the Rust allocator ends the process when it cannot get memory, and the
 /// point here is to find out where the limit stops the process, not to end
 /// it.
+///
+/// The memory is held, so the usage of the instance stays high and can be
+/// seen on the dashboard.
 pub fn memory() -> String {
     const BLOCK: usize = 4 * 1024 * 1024;
 
-    let mut blocks: Vec<*mut u8> = Vec::new();
+    let mut blocks: Vec<usize> = Vec::new();
     let mut total_mb = 0u64;
 
     loop {
         // SAFETY: the pointer is only used when it is not null, and it is
-        // freed again at the end of the function.
+        // kept in the list of held blocks until the process ends.
         let block = unsafe { libc::malloc(BLOCK) } as *mut u8;
         if block.is_null() {
             break;
         }
         // The block is written to, so the pages are really taken.
         unsafe { std::ptr::write_bytes(block, 1, BLOCK) };
-        blocks.push(block);
+        blocks.push(block as usize);
         total_mb += (BLOCK / (1024 * 1024)) as u64;
     }
 
-    // SAFETY: every pointer in the list came from malloc and is freed once.
-    unsafe {
-        for block in blocks {
-            libc::free(block as *mut libc::c_void);
-        }
-    }
+    // The memory is kept, so the usage of the instance stays high.
+    let held = {
+        let mut held = HELD.lock().unwrap();
+        held.extend(blocks);
+        held.len() as u64 * (BLOCK / (1024 * 1024)) as u64
+    };
 
     format!(
         "The memory limit stopped this process after {total_mb} MB. \
-         The memory was released again."
+         The instance now holds {held} MB, and the memory is kept until the \
+         instance is stopped."
     )
 }
 
@@ -66,15 +77,24 @@ pub fn cpu() -> String {
         );
     }
 
-    let mut value: u64 = 0;
-    loop {
-        // The work is done on a value that is never used, so the compiler
-        // cannot throw it away.
-        value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
-        if value == 0 {
-            println!("impossible");
+    // The work is done in a thread of its own, so the server keeps
+    // answering while the processor is busy. The panel can then show what
+    // the instance is using.
+    std::thread::spawn(|| {
+        let mut value: u64 = 0;
+        loop {
+            // The work is done on a value that is never used, so the
+            // compiler cannot throw it away.
+            value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if value == 0 {
+                println!("impossible");
+            }
         }
-    }
+    });
+
+    "The processor is now busy. The instance uses as much processor time as \
+     it can, until the limit of the panel stops it."
+        .to_string()
 }
 
 /// The handler for the cpu limit.

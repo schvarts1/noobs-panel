@@ -7,5 +7,6 @@ pub mod db;
 pub mod instances;
 pub mod models;
 pub mod presets;
+pub mod site;
 pub mod views;
 pub mod web;

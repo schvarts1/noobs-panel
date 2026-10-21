@@ -8,17 +8,20 @@ pub enum Preset {
     HelloWorld,
     /// The benchmarker, which pushes against the limits of the instance.
     Benchmarker,
+    /// An empty site the user of the instance fills with their own code.
+    Site,
 }
 
 impl Preset {
     /// Every preset there is.
-    pub const ALL: [Preset; 2] = [Preset::HelloWorld, Preset::Benchmarker];
+    pub const ALL: [Preset; 3] = [Preset::HelloWorld, Preset::Benchmarker, Preset::Site];
 
     /// The name of the preset in the database.
     pub fn slug(self) -> &'static str {
         match self {
             Preset::HelloWorld => "hello-world",
             Preset::Benchmarker => "benchmarker",
+            Preset::Site => "site",
         }
     }
 
@@ -27,6 +30,7 @@ impl Preset {
         match self {
             Preset::HelloWorld => "Hello World",
             Preset::Benchmarker => "Benchmarker",
+            Preset::Site => "My site",
         }
     }
 
@@ -41,15 +45,32 @@ impl Preset {
                 "A web server that uses as much memory, processor time and disk as \
                  it can, so the limits of the instance can be checked."
             }
+            Preset::Site => {
+                "An empty website. You can write the html, the style and the \
+                 script of it yourself, in the editor of the instance."
+            }
         }
     }
 
     /// The binary that runs the preset.
     pub fn binary(self) -> &'static str {
         match self {
-            Preset::HelloWorld => "hello-server",
+            Preset::HelloWorld | Preset::Site => "hello-server",
             Preset::Benchmarker => "benchmarker",
         }
+    }
+
+    /// Whether the user of the instance can edit the files of the site.
+    pub fn is_editable(self) -> bool {
+        matches!(self, Preset::Site | Preset::HelloWorld)
+    }
+
+    /// Whether the instance starts with the files of a site.
+    ///
+    /// The hello world preset keeps its own page until the user writes one,
+    /// so it starts without any files.
+    pub fn starts_with_files(self) -> bool {
+        matches!(self, Preset::Site)
     }
 
     /// The preset with a given name, if there is one.
@@ -73,6 +94,21 @@ mod tests {
     fn an_unknown_name_is_no_preset() {
         assert_eq!(Preset::from_slug("nope"), None);
         assert_eq!(Preset::from_slug(""), None);
+    }
+
+    #[test]
+    fn the_site_runs_the_same_binary_as_the_hello_world() {
+        assert_eq!(Preset::Site.binary(), Preset::HelloWorld.binary());
+    }
+
+    #[test]
+    fn only_the_site_presets_can_be_edited() {
+        for preset in Preset::ALL {
+            assert_eq!(
+                preset.is_editable(),
+                preset == Preset::Site || preset == Preset::HelloWorld
+            );
+        }
     }
 
     #[test]

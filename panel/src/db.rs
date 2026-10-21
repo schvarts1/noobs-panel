@@ -81,7 +81,7 @@ impl Database {
                 is_active         INTEGER NOT NULL DEFAULT 1,
                 created_at        INTEGER NOT NULL,
                 memory_limit_mb   INTEGER NOT NULL DEFAULT 256,
-                cpu_limit_seconds INTEGER NOT NULL DEFAULT 60,
+                cpu_limit_percent INTEGER NOT NULL DEFAULT 200,
                 disk_limit_mb     INTEGER NOT NULL DEFAULT 1024,
                 instance_limit    INTEGER NOT NULL DEFAULT 5
             );
@@ -110,7 +110,7 @@ impl Database {
                 state             TEXT    NOT NULL DEFAULT 'stopped',
                 pid               INTEGER,
                 memory_limit_mb   INTEGER NOT NULL DEFAULT 256,
-                cpu_limit_seconds INTEGER NOT NULL DEFAULT 60,
+                cpu_limit_percent INTEGER NOT NULL DEFAULT 50,
                 disk_limit_mb     INTEGER NOT NULL DEFAULT 1024,
                 created_at        INTEGER NOT NULL,
                 exit_code         INTEGER
@@ -123,6 +123,12 @@ impl Database {
         // The tables above are only made when they are not there yet, so a
         // table from an earlier version is brought up to date by hand.
         self.add_column_if_missing("instances", "preset", "TEXT NOT NULL DEFAULT 'hello-world'")?;
+        self.add_column_if_missing("users", "cpu_limit_percent", "INTEGER NOT NULL DEFAULT 200")?;
+        self.add_column_if_missing(
+            "instances",
+            "cpu_limit_percent",
+            "INTEGER NOT NULL DEFAULT 50",
+        )?;
 
         Ok(())
     }
@@ -173,7 +179,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
-                        memory_limit_mb, cpu_limit_seconds, disk_limit_mb, instance_limit
+                        memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
                  FROM users WHERE username = ?1",
                 params![username],
                 map_user,
@@ -188,7 +194,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
-                        memory_limit_mb, cpu_limit_seconds, disk_limit_mb, instance_limit
+                        memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
                  FROM users WHERE id = ?1",
                 params![id],
                 map_user,
@@ -203,7 +209,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT id, username, email, role, is_active, created_at,
-                        memory_limit_mb, cpu_limit_seconds, disk_limit_mb, instance_limit
+                        memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
                  FROM users WHERE email = ?1",
                 params![email],
                 map_user,
@@ -229,7 +235,7 @@ impl Database {
     pub fn all_users(&self) -> Result<Vec<User>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, username, email, role, is_active, created_at,
-                    memory_limit_mb, cpu_limit_seconds, disk_limit_mb, instance_limit
+                    memory_limit_mb, cpu_limit_percent, disk_limit_mb, instance_limit
              FROM users ORDER BY id",
         )?;
         let users = stmt
@@ -270,15 +276,15 @@ impl Database {
         &self,
         user_id: i64,
         memory_mb: i64,
-        cpu_seconds: i64,
+        cpu_percent: i64,
         disk_mb: i64,
         instance_limit: i64,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE users
-             SET memory_limit_mb = ?1, cpu_limit_seconds = ?2, disk_limit_mb = ?3, instance_limit = ?4
+             SET memory_limit_mb = ?1, cpu_limit_percent = ?2, disk_limit_mb = ?3, instance_limit = ?4
              WHERE id = ?5",
-            params![memory_mb, cpu_seconds, disk_mb, instance_limit, user_id],
+            params![memory_mb, cpu_percent, disk_mb, instance_limit, user_id],
         )?;
         Ok(())
     }
@@ -380,14 +386,14 @@ impl Database {
         owner_id: i64,
         port: u16,
         memory_limit_mb: i64,
-        cpu_limit_seconds: i64,
+        cpu_limit_percent: i64,
         disk_limit_mb: i64,
         preset: &str,
         created_at: i64,
     ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO instances
-                 (name, owner_id, port, state, memory_limit_mb, cpu_limit_seconds,
+                 (name, owner_id, port, state, memory_limit_mb, cpu_limit_percent,
                   disk_limit_mb, preset, created_at)
              VALUES (?1, ?2, ?3, 'stopped', ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -395,7 +401,7 @@ impl Database {
                 owner_id,
                 port,
                 memory_limit_mb,
-                cpu_limit_seconds,
+                cpu_limit_percent,
                 disk_limit_mb,
                 preset,
                 created_at
@@ -419,7 +425,7 @@ impl Database {
             .conn
             .query_row(
                 "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
-                        i.memory_limit_mb, i.cpu_limit_seconds, i.disk_limit_mb,
+                        i.memory_limit_mb, i.cpu_limit_percent, i.disk_limit_mb,
                         i.created_at, i.exit_code, i.preset
                  FROM instances i JOIN users u ON u.id = i.owner_id
                  WHERE i.id = ?1",
@@ -434,7 +440,7 @@ impl Database {
     pub fn list_instances(&self, owner_id: Option<i64>) -> Result<Vec<Instance>> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.name, i.owner_id, u.username, i.port, i.state, i.pid,
-                    i.memory_limit_mb, i.cpu_limit_seconds, i.disk_limit_mb,
+                    i.memory_limit_mb, i.cpu_limit_percent, i.disk_limit_mb,
                     i.created_at, i.exit_code, i.preset
              FROM instances i JOIN users u ON u.id = i.owner_id
              ORDER BY i.id",
@@ -482,13 +488,13 @@ impl Database {
         &self,
         id: i64,
         memory_limit_mb: i64,
-        cpu_limit_seconds: i64,
+        cpu_limit_percent: i64,
         disk_limit_mb: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET memory_limit_mb = ?1, cpu_limit_seconds = ?2, disk_limit_mb = ?3
+            "UPDATE instances SET memory_limit_mb = ?1, cpu_limit_percent = ?2, disk_limit_mb = ?3
              WHERE id = ?4",
-            params![memory_limit_mb, cpu_limit_seconds, disk_limit_mb, id],
+            params![memory_limit_mb, cpu_limit_percent, disk_limit_mb, id],
         )?;
         Ok(())
     }
@@ -511,7 +517,7 @@ fn map_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         is_active: row.get::<_, i64>(4)? != 0,
         created_at: row.get(5)?,
         memory_limit_mb: row.get(6)?,
-        cpu_limit_seconds: row.get(7)?,
+        cpu_limit_percent: row.get(7)?,
         disk_limit_mb: row.get(8)?,
         instance_limit: row.get(9)?,
     })
@@ -528,7 +534,7 @@ fn map_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         state: InstanceState::from_db(&row.get::<_, String>(5)?),
         pid: row.get(6)?,
         memory_limit_mb: row.get(7)?,
-        cpu_limit_seconds: row.get(8)?,
+        cpu_limit_percent: row.get(8)?,
         disk_limit_mb: row.get(9)?,
         created_at: row.get(10)?,
         exit_code: row.get(11)?,
@@ -628,7 +634,7 @@ mod tests {
         let user = db.user_by_id(id).unwrap().unwrap();
         assert!(user.is_admin());
         assert_eq!(user.memory_limit_mb, 512);
-        assert_eq!(user.cpu_limit_seconds, 120);
+        assert_eq!(user.cpu_limit_percent, 120);
         assert_eq!(user.disk_limit_mb, 2048);
         assert_eq!(user.instance_limit, 10);
         assert!(!user.is_active);
@@ -655,7 +661,7 @@ mod tests {
         let user = db.user_by_id(id).unwrap().unwrap();
         let defaults = Limits::default();
         assert_eq!(user.memory_limit_mb, defaults.memory_mb);
-        assert_eq!(user.cpu_limit_seconds, defaults.cpu_seconds);
+        assert_eq!(user.cpu_limit_percent, defaults.cpu_percent);
         assert_eq!(user.disk_limit_mb, defaults.disk_mb);
     }
 }

@@ -32,7 +32,7 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(err) = server::serve(bound, args.host) {
+    if let Err(err) = server::serve_with_root(bound, args.host, args.root.clone()) {
         eprintln!("error: server failed: {err}");
         return ExitCode::FAILURE;
     }

@@ -1,14 +1,21 @@
 //! Managing the web server instances that the panel runs.
 //!
-//! Each instance is a child process running the `hello-server` binary. The
+//! Each instance is a child process running the binary of its preset. The
 //! child is started with resource limits applied through `setrlimit`, so a
-//! runaway instance cannot take more memory, cpu time or disk space than it
-//! was granted.
+//! runaway instance cannot take more memory or disk space than it was
+//! granted.
+//!
+//! The share of the processor is kept in the panel itself, because the
+//! kernel has no way of saying "this process may use half a processor". The
+//! panel watches how much processor time the child uses and pauses it when
+//! it has used too much, which is what a limit of a percentage means.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::db::{Database, Result as DbResult};
 use crate::models::{Instance, InstanceState, Usage};
@@ -18,17 +25,33 @@ use crate::presets::Preset;
 /// `/proc/<pid>/stat` into seconds.
 const CLOCK_TICKS_PER_SECOND: f64 = 100.0;
 
-/// How much processor time an instance may use past its limit, before the
-/// kernel stops it without asking.
-const CPU_GRACE_SECONDS: u64 = 5;
+/// How much processor time an instance may use in total, before the kernel
+/// stops it without asking.
+///
+/// The share of the processor is kept by the panel, and this is only the
+/// backstop for a process that ignores the pauses.
+const CPU_BACKSTOP_SECONDS: u64 = 24 * 60 * 60;
+
+/// How often the panel looks at an instance to see how much processor time
+/// it used.
+const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The longest an instance may be paused in one go.
+const MAX_PAUSE: Duration = Duration::from_secs(5);
+
+/// The number of samples the share of the processor is worked out over.
+///
+/// With a sample every quarter of a second this is about two seconds, so
+/// an instance can burst for a moment, but not for long.
+const SAMPLE_COUNT: usize = 8;
 
 /// Resource limits applied to a child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessLimits {
     /// Maximum resident memory, in megabytes.
     pub memory_mb: i64,
-    /// Maximum cpu time, in seconds.
-    pub cpu_seconds: i64,
+    /// Share of the processor the instance may use, in percent.
+    pub cpu_percent: i64,
     /// Maximum disk size of a written file, in megabytes.
     pub disk_mb: i64,
 }
@@ -37,7 +60,7 @@ impl Default for ProcessLimits {
     fn default() -> Self {
         ProcessLimits {
             memory_mb: 256,
-            cpu_seconds: 60,
+            cpu_percent: 50,
             disk_mb: 1024,
         }
     }
@@ -46,6 +69,20 @@ impl Default for ProcessLimits {
 /// A running instance process.
 struct Managed {
     child: Child,
+    /// Tells the watcher to stop.
+    stop: Arc<AtomicBool>,
+}
+
+/// What the panel knows about a running instance right now.
+#[derive(Debug, Clone, Default)]
+pub struct LiveUsage {
+    /// Resident memory in kilobytes.
+    pub memory_kb: u64,
+    /// Share of the processor in use, in percent.
+    pub cpu_percent: u64,
+    /// Whether the instance is paused because it used too much processor
+    /// time.
+    pub throttled: bool,
 }
 
 /// Keeps track of the running instance processes.
@@ -53,6 +90,10 @@ pub struct InstanceManager {
     running: Mutex<HashMap<i64, Managed>>,
     /// The binary of every preset, found when it is first needed.
     binaries: Mutex<HashMap<&'static str, PathBuf>>,
+    /// What the running instances are using right now.
+    ///
+    /// It is shared with the watchers, which keep it up to date.
+    usage: Arc<Mutex<HashMap<i64, LiveUsage>>>,
 }
 
 impl Default for InstanceManager {
@@ -67,6 +108,7 @@ impl InstanceManager {
         InstanceManager {
             running: Mutex::new(HashMap::new()),
             binaries: Mutex::new(HashMap::new()),
+            usage: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -120,7 +162,7 @@ impl InstanceManager {
 
         let limits = ProcessLimits {
             memory_mb: instance.memory_limit_mb,
-            cpu_seconds: instance.cpu_limit_seconds,
+            cpu_percent: instance.cpu_limit_percent,
             disk_mb: instance.disk_limit_mb,
         };
 
@@ -138,7 +180,13 @@ impl InstanceManager {
             .arg("--port")
             .arg(instance.port.to_string())
             .arg("--host")
-            .arg("127.0.0.1")
+            .arg("127.0.0.1");
+        // A site is served from the directory of the instance, so the files
+        // the user writes in the editor are the ones that are served.
+        if instance.preset.is_editable() {
+            command.arg("--root").arg(&work_dir);
+        }
+        command
             .current_dir(&work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -168,10 +216,21 @@ impl InstanceManager {
             }
         };
 
+        // The watcher keeps the instance inside its share of the processor
+        // and measures what it uses.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _watcher = watch(
+            instance.id,
+            child.id() as i32,
+            limits.cpu_percent,
+            stop.clone(),
+            self.usage.clone(),
+        );
+
         self.running
             .lock()
             .unwrap()
-            .insert(instance.id, Managed { child });
+            .insert(instance.id, Managed { child, stop });
 
         // The instance may have had to move to another port.
         if actual_port != instance.port {
@@ -188,6 +247,10 @@ impl InstanceManager {
     /// Stop the web server of an instance.
     pub fn stop(&self, db: &Database, instance: &Instance) -> std::result::Result<(), String> {
         let managed = self.running.lock().unwrap().remove(&instance.id);
+        if let Some(managed) = &managed {
+            managed.stop.store(true, Ordering::Relaxed);
+        }
+        self.usage.lock().unwrap().remove(&instance.id);
 
         // An instance started by an earlier run of the panel is not in the
         // map, so the recorded pid is used instead.
@@ -217,50 +280,33 @@ impl InstanceManager {
     pub fn stop_all(&self) {
         let mut running = self.running.lock().unwrap();
         for (_, mut managed) in running.drain() {
+            managed.stop.store(true, Ordering::Relaxed);
             terminate_pid(managed.child.id() as i32);
             let _ = managed.child.wait();
         }
+        self.usage.lock().unwrap().clear();
     }
 
     /// The resources an instance is using right now.
+    ///
+    /// The watcher of the instance keeps this up to date, so the number is
+    /// the one the instance had a moment ago. An instance that the panel
+    /// does not watch is measured here and now.
     pub fn usage(&self, instance: &Instance) -> Usage {
         let mut usage = Usage::default();
         let Some(pid) = self.live_pid(instance) else {
             return usage;
         };
 
-        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            for line in status.lines() {
-                if let Some(value) = line.strip_prefix("VmRSS:") {
-                    usage.memory_kb = value
-                        .split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0);
-                }
-            }
+        if let Some(live) = self.usage.lock().unwrap().get(&instance.id) {
+            usage.memory_kb = live.memory_kb;
+            usage.cpu_percent = live.cpu_percent;
+            usage.disk_kb = 0;
+            return usage;
         }
 
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            // The second field is the command name in parentheses and may
-            // contain spaces, so the fields after it are located from the
-            // last closing parenthesis.
-            if let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) {
-                let fields: Vec<&str> = rest.split_whitespace().collect();
-                // After the state field, utime is field 11 and stime field
-                // 12 of the original numbering.
-                let utime = fields
-                    .get(11)
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let stime = fields
-                    .get(12)
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                usage.cpu_seconds = ((utime + stime) as f64 / CLOCK_TICKS_PER_SECOND) as u64;
-            }
-        }
-
+        usage.memory_kb = resident_memory(pid);
+        usage.cpu_percent = measure_cpu_percent(pid);
         usage
     }
 
@@ -283,7 +329,7 @@ impl InstanceManager {
 pub fn find_binary(preset: Preset) -> Option<PathBuf> {
     // The environment can point at a binary.
     let variable = match preset {
-        Preset::HelloWorld => "NOOBS_INSTANCE_BIN",
+        Preset::HelloWorld | Preset::Site => "NOOBS_INSTANCE_BIN",
         Preset::Benchmarker => "NOOBS_BENCHMARKER_BIN",
     };
     if let Ok(path) = std::env::var(variable) {
@@ -324,6 +370,187 @@ pub fn find_binary(preset: Preset) -> Option<PathBuf> {
     None
 }
 
+/// Watch a running instance.
+///
+/// The watcher keeps the instance inside its share of the processor and
+/// records what the instance is using, so the panel can show it without
+/// having to look at `/proc` for every page.
+fn watch(
+    id: i64,
+    pid: i32,
+    cpu_percent: i64,
+    stop: Arc<AtomicBool>,
+    manager: Arc<Mutex<HashMap<i64, LiveUsage>>>,
+) -> std::thread::JoinHandle<()> {
+    // The moment the process started, so a process that takes the same
+    // number later is not mistaken for the instance.
+    let started = process_start_time(pid);
+
+    std::thread::spawn(move || {
+        let mut last_cpu = cpu_time(pid);
+        let mut last_wall = Instant::now();
+        let mut used = LiveUsage::default();
+
+        // The samples of the last few moments. The share of the processor
+        // is worked out over them, so a pause counts as the time it takes,
+        // and the instance is not allowed to burst for a long time.
+        let mut samples: VecDeque<(f64, f64)> = VecDeque::new();
+
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(WATCH_INTERVAL);
+            if !process_alive(pid) {
+                break;
+            }
+            if process_start_time(pid) != started {
+                // Another process took the number, so this is not the
+                // instance any more.
+                break;
+            }
+
+            let now = Instant::now();
+            let cpu = cpu_time(pid);
+            let wall = now.duration_since(last_wall).as_secs_f64();
+            let taken = (cpu - last_cpu).max(0.0);
+            last_cpu = cpu;
+            last_wall = now;
+
+            samples.push_back((taken, wall));
+            while samples.len() > SAMPLE_COUNT {
+                samples.pop_front();
+            }
+
+            let used_cpu: f64 = samples.iter().map(|(cpu, _)| cpu).sum();
+            let used_wall: f64 = samples.iter().map(|(_, wall)| wall).sum();
+
+            // The share of the processor the instance may use.
+            let share = cpu_percent.clamp(0, 100) as f64 / 100.0;
+
+            // The time the instance used more than it was allowed to use.
+            let excess = used_cpu - used_wall * share;
+
+            if share > 0.0 && share < 1.0 && excess > 0.0 {
+                // The instance used too much processor time, so it is paused
+                // until it has earned the time back. The pause is the time
+                // it used too much, divided by the share it may use, so the
+                // instance ends the pause with the time it used too much
+                // again in hand.
+                let pause = Duration::from_secs_f64((excess / share).min(MAX_PAUSE.as_secs_f64()));
+                used.throttled = true;
+                pause_process(pid, pause, &stop);
+                used.throttled = false;
+            }
+
+            used.cpu_percent = if used_wall > 0.0 {
+                ((used_cpu / used_wall) * 100.0).round().clamp(0.0, 999.0) as u64
+            } else {
+                0
+            };
+            used.memory_kb = resident_memory(pid);
+
+            manager.lock().unwrap().insert(id, used.clone());
+        }
+
+        manager.lock().unwrap().remove(&id);
+    })
+}
+
+/// Pause a process for a while and let it run again afterwards.
+///
+/// The pause is cut short when the watcher is told to stop, so an instance
+/// that is stopped is never left hanging.
+fn pause_process(pid: i32, pause: Duration, stop: &AtomicBool) {
+    if pause.is_zero() {
+        return;
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+    }
+    let mut left = pause;
+    while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+        let step = left.min(Duration::from_millis(50));
+        std::thread::sleep(step);
+        left -= step;
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
+}
+
+/// The moment a process started, in clock ticks since it was started.
+///
+/// It is the field the kernel keeps for the process, so a process that
+/// takes the same number later has a different value.
+fn process_start_time(pid: i32) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
+        return 0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // The start time is field 22 of the whole line, and the fields before it
+    // are counted from the name.
+    fields
+        .get(19)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The share of the processor a process is using, in percent.
+///
+/// The processor time is measured twice, a moment apart, so the share is
+/// the one the process really has.
+fn measure_cpu_percent(pid: i32) -> u64 {
+    let first = cpu_time(pid);
+    let start = Instant::now();
+    std::thread::sleep(WATCH_INTERVAL);
+    let second = cpu_time(pid);
+    let wall = start.elapsed().as_secs_f64();
+    if wall <= 0.0 {
+        return 0;
+    }
+    (((second - first).max(0.0) / wall) * 100.0).round() as u64
+}
+
+/// The processor time a process has used, in seconds.
+fn cpu_time(pid: i32) -> f64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0.0;
+    };
+    // The command name is in brackets and may contain spaces, so the fields
+    // are counted from the last closing bracket.
+    let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime = fields
+        .get(11)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let stime = fields
+        .get(12)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    (utime + stime) / CLOCK_TICKS_PER_SECOND
+}
+
+/// The resident memory of a process, in kilobytes.
+fn resident_memory(pid: i32) -> u64 {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            return value
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
 /// Apply the resource limits to a command before it is started.
 ///
 /// `RLIMIT_DATA` is used for the memory limit rather than `RLIMIT_AS`. The
@@ -340,7 +567,6 @@ fn apply_limits(command: &mut Command, limits: ProcessLimits) -> std::result::Re
 
     let memory_bytes = limits.memory_mb.max(1) as u64 * 1024 * 1024;
     let disk_bytes = limits.disk_mb.max(1) as u64 * 1024 * 1024;
-    let cpu_seconds = limits.cpu_seconds.max(1) as u64;
 
     // The closure runs in the child process between fork and exec, so it
     // must not allocate or do anything that is not async signal safe.
@@ -348,15 +574,9 @@ fn apply_limits(command: &mut Command, limits: ProcessLimits) -> std::result::Re
         command.pre_exec(move || {
             set_limit(libc::RLIMIT_DATA, memory_bytes, memory_bytes);
             set_limit(libc::RLIMIT_FSIZE, disk_bytes, disk_bytes);
-            // The soft limit is the one that counts. The hard limit is a
-            // little higher, so the kernel sends the signal that a program
-            // can handle first, and the hard limit only catches a program
-            // that ignores it.
-            set_limit(
-                libc::RLIMIT_CPU,
-                cpu_seconds,
-                cpu_seconds.saturating_add(CPU_GRACE_SECONDS),
-            );
+            // The share of the processor is kept by the panel, and this is
+            // only the backstop for a process that ignores the pauses.
+            set_limit(libc::RLIMIT_CPU, CPU_BACKSTOP_SECONDS, CPU_BACKSTOP_SECONDS);
             Ok(())
         });
     }
@@ -520,7 +740,7 @@ mod tests {
         let limits = ProcessLimits {
             memory_mb: 128,
             disk_mb: 512,
-            cpu_seconds: 30,
+            cpu_percent: 50,
         };
         assert_eq!(limits.memory_mb * 1024 * 1024, 134_217_728);
         let _ = Ipv4Addr::LOCALHOST;

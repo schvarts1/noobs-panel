@@ -190,6 +190,20 @@ pub fn html(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap())
 }
 
+/// Build a response with a body of json.
+pub fn json(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_string(body)
+        .with_status_code(StatusCode(status))
+        .with_header(
+            Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json; charset=utf-8"[..],
+            )
+            .unwrap(),
+        )
+        .with_header(Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).unwrap())
+}
+
 /// Build a redirect response.
 pub fn redirect(location: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string("")

@@ -3,6 +3,7 @@
 use std::env;
 use std::fmt;
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 /// Default port used when nothing else is specified.
 pub const DEFAULT_PORT: u16 = 8000;
@@ -18,6 +19,10 @@ pub struct Args {
     /// Port we would like to use. It may end up being changed by the
     /// fallback search when the preferred port is busy.
     pub desired_port: u16,
+    /// Directory the files of the site are served from.
+    ///
+    /// When it is empty the built in hello world page is served.
+    pub root: Option<PathBuf>,
 }
 
 /// Failure while parsing the command line.
@@ -72,6 +77,7 @@ impl Args {
 
         let mut port: Option<u16> = None;
         let mut host: Option<IpAddr> = None;
+        let mut root: Option<PathBuf> = None;
 
         let mut idx = 0;
         while idx < args.len() {
@@ -114,6 +120,10 @@ impl Args {
                     let value = take_value(&flag)?;
                     host = Some(parse_host(&value)?);
                 }
+                "-r" | "--root" => {
+                    let value = take_value(&flag)?;
+                    root = Some(PathBuf::from(value));
+                }
                 other => {
                     return Err(ArgsError::Invalid(format!("unknown argument `{other}`")));
                 }
@@ -136,7 +146,11 @@ impl Args {
             },
         };
 
-        Ok(Args { host, desired_port })
+        Ok(Args {
+            host,
+            desired_port,
+            root,
+        })
     }
 }
 
@@ -173,6 +187,7 @@ USAGE:
 OPTIONS:
     -p, --port <PORT>    Preferred port to listen on [default: {default_port}]
     -b, --host <HOST>    Address to bind to [default: {default_host}]
+    -r, --root <DIR>     Directory the files of the site are served from
     -h, --help           Print this help and exit
     -V, --version        Print version information and exit
 

@@ -1,6 +1,6 @@
 //! The HTML pages of the panel.
 
-use crate::models::{Instance, Role, User};
+use crate::models::{Instance, Role, Usage, User};
 use crate::presets::Preset;
 use crate::web::escape;
 
@@ -70,6 +70,21 @@ select {
   width: 100%; padding: .5rem .6rem; border-radius: 7px; border: 1px solid var(--border);
   background: var(--panel-2); color: var(--text); font-size: .92rem; font-family: inherit;
 }
+.editor {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem;
+  line-height: 1.5;
+  padding: .8rem;
+  border: 1px solid var(--line);
+  border-radius: .5rem;
+  background: #0b0f13;
+  color: #e8edf2;
+  resize: vertical;
+}
+.usage { margin-top: .6rem; font-size: .9rem; }
+.usage td { padding: .15rem .4rem .15rem 0; border: none; }
+.usage td:first-child { opacity: .7; }
 .choices { display: flex; flex-direction: column; gap: .5rem; }
 .choice {
   display: grid; grid-template-columns: auto 1fr; gap: .1rem .6rem; align-items: center;
@@ -121,6 +136,7 @@ fn layout(title: &str, user: Option<&User>, csrf: &str, content: &str) -> String
                 nav.push_str(r#"<a href="/instances/new">New instance</a>"#);
             }
             if user.is_admin() {
+                nav.push_str(r#"<a href="/instances">Instances</a>"#);
                 nav.push_str(r#"<a href="/admin">Admin</a>"#);
             }
             format!(
@@ -232,13 +248,15 @@ pub fn dashboard_page(
     user: &User,
     csrf: &str,
     instances: &[Instance],
+    usage: &[Usage],
     used_memory: i64,
     used_cpu: i64,
     used_disk: i64,
 ) -> String {
     let mut cards = String::new();
-    for instance in instances {
-        cards.push_str(&instance_card(instance));
+    for (index, instance) in instances.iter().enumerate() {
+        let usage = usage.get(index).cloned().unwrap_or_default();
+        cards.push_str(&instance_card(instance, &usage));
     }
     if cards.is_empty() {
         cards = if user.is_admin() {
@@ -254,7 +272,7 @@ pub fn dashboard_page(
 <div class="stats">
   <div class="stat"><div class="label">Instances</div><div class="value">{count} / {max}</div></div>
   <div class="stat"><div class="label">Memory allocated</div><div class="value">{memory} / {memory_max} MB</div></div>
-  <div class="stat"><div class="label">CPU time allocated</div><div class="value">{cpu} / {cpu_max} s</div></div>
+  <div class="stat"><div class="label">CPU allocated</div><div class="value">{cpu} / {cpu_max} %</div></div>
   <div class="stat"><div class="label">Disk allocated</div><div class="value">{disk} / {disk_max} MB</div></div>
 </div>
 <div class="card">
@@ -263,17 +281,19 @@ pub fn dashboard_page(
     {new_button}
   </div>
 </div>
-<div class="grid">{cards}</div>"#,
+<div class="grid">{cards}</div>
+{live}"#,
         username = escape(&user.username),
         count = instances.len(),
         max = user.instance_limit,
         memory = used_memory,
         memory_max = user.memory_limit_mb,
         cpu = used_cpu,
-        cpu_max = user.cpu_limit_seconds,
+        cpu_max = user.cpu_limit_percent,
         disk = used_disk,
         disk_max = user.disk_limit_mb,
         cards = cards,
+        live = live_script(),
         new_button = if user.is_admin() {
             r#"<a class="btn primary" href="/instances/new">New instance</a>"#
         } else {
@@ -284,22 +304,30 @@ pub fn dashboard_page(
 }
 
 /// A single instance card.
-fn instance_card(instance: &Instance) -> String {
+fn instance_card(instance: &Instance, usage: &Usage) -> String {
     format!(
-        r#"<div class="card">
+        r#"<div class="card" data-instance="{id}">
   <div class="row" style="justify-content:space-between">
     <strong>{name}</strong>
     <span class="badge {state}">{label}</span>
   </div>
   <p class="muted mono" style="margin:.4rem 0 0">Port {port} &middot; {owner}</p>
+  <table class="usage">
+    <tr><td>Memory</td><td class="usage-memory">{memory} KB</td><td class="muted">of {memory_limit} MB</td></tr>
+    <tr><td>CPU</td><td class="usage-cpu">{cpu} %</td><td class="muted">of {cpu_limit} %</td></tr>
+  </table>
   <div class="actions"><a class="btn" href="/instances/{id}">Manage</a></div>
 </div>"#,
+        id = instance.id,
         name = escape(&instance.name),
         state = instance.state.as_db(),
         label = instance.state.label(),
         port = instance.port,
         owner = escape(&instance.owner_username),
-        id = instance.id,
+        memory = usage.memory_kb,
+        memory_limit = instance.memory_limit_mb,
+        cpu = usage.cpu_percent,
+        cpu_limit = instance.cpu_limit_percent,
     )
 }
 
@@ -318,6 +346,19 @@ pub fn new_instance_page(
         .unwrap_or_default();
     let presets = preset_options();
     let owners = owner_options(users, user.id);
+
+    // The limits in the form are a hint, the panel checks the real quota of
+    // the account the instance is for. The largest quota of the accounts is
+    // used, so the form does not stop an administrator that has more to
+    // give.
+    let max_memory = users.iter().map(|u| u.memory_limit_mb).max().unwrap_or(0);
+    let max_disk = users.iter().map(|u| u.disk_limit_mb).max().unwrap_or(0);
+    let max_cpu = users
+        .iter()
+        .map(|u| u.cpu_limit_percent)
+        .max()
+        .unwrap_or(0)
+        .min(100);
     let content = format!(
         r#"<h1>New instance</h1>
 <p class="sub">Create a web server and hand it to an account.</p>
@@ -333,8 +374,8 @@ pub fn new_instance_page(
 <div class="choices">{presets}</div></div>
 <div class="field"><label for="memory">Memory limit (MB)</label>
 <input id="memory" name="memory" type="number" min="16" max="{max_memory}" value="128" required></div>
-<div class="field"><label for="cpu">CPU time limit (seconds)</label>
-<input id="cpu" name="cpu" type="number" min="1" max="{max_cpu}" value="30" required></div>
+<div class="field"><label for="cpu">CPU limit (% of one core)</label>
+<input id="cpu" name="cpu" type="number" min="1" max="{max_cpu}" value="50" required></div>
 <div class="field"><label for="disk">Disk limit (MB)</label>
 <input id="disk" name="disk" type="number" min="16" max="{max_disk}" value="256" required></div>
 <button class="primary" type="submit">Create instance</button>
@@ -345,7 +386,7 @@ pub fn new_instance_page(
   <table>
     <tr><th>Resource</th><th>Allocated</th><th>Limit</th></tr>
     <tr><td>Memory</td><td>{used_memory} MB</td><td>{max_memory} MB</td></tr>
-    <tr><td>CPU time</td><td>{used_cpu} s</td><td>{max_cpu} s</td></tr>
+    <tr><td>CPU</td><td>{used_cpu} %</td><td>{max_cpu} %</td></tr>
     <tr><td>Disk</td><td>{used_disk} MB</td><td>{max_disk} MB</td></tr>
   </table>
 </div>"#,
@@ -353,9 +394,9 @@ pub fn new_instance_page(
         csrf = escape(csrf),
         presets = presets,
         owners = owners,
-        max_memory = user.memory_limit_mb,
-        max_cpu = user.cpu_limit_seconds,
-        max_disk = user.disk_limit_mb,
+        max_memory = max_memory,
+        max_cpu = max_cpu,
+        max_disk = max_disk,
         used_memory = used_memory,
         used_cpu = used_cpu,
         used_disk = used_disk,
@@ -407,7 +448,7 @@ pub fn instance_page(
     instance: &Instance,
     csrf: &str,
     memory_kb: u64,
-    cpu_seconds: u64,
+    cpu_percent: u64,
     disk_kb: u64,
     is_admin: bool,
     users: &[User],
@@ -418,7 +459,7 @@ pub fn instance_page(
 <div class="stats">
   <div class="stat"><div class="label">Port</div><div class="value">{port}</div></div>
   <div class="stat"><div class="label">Memory</div><div class="value">{memory_mb} MB</div></div>
-  <div class="stat"><div class="label">CPU time</div><div class="value">{cpu_limit} s</div></div>
+  <div class="stat"><div class="label">CPU</div><div class="value">{cpu_limit} %</div></div>
   <div class="stat"><div class="label">Disk</div><div class="value">{disk_limit} MB</div></div>
 </div>
 <div class="card">
@@ -444,10 +485,11 @@ pub fn instance_page(
   <table>
     <tr><th>Resource</th><th>In use</th><th>Limit</th></tr>
     <tr><td>Memory</td><td>{memory_kb} KB</td><td>{memory_limit_mb} MB</td></tr>
-    <tr><td>CPU time</td><td>{cpu_seconds} s</td><td>{cpu_limit} s</td></tr>
+    <tr><td>CPU</td><td>{cpu_percent} %</td><td>{cpu_limit} %</td></tr>
     <tr><td>Disk</td><td>{disk_kb} KB</td><td>{disk_limit_mb} MB</td></tr>
   </table>
 </div>
+{site_card}
 <div class="card">
   <h2 style="margin-top:0">Details</h2>
   <table>
@@ -464,12 +506,12 @@ pub fn instance_page(
         label = instance.state.label(),
         port = instance.port,
         memory_mb = instance.memory_limit_mb,
-        cpu_limit = instance.cpu_limit_seconds,
+        cpu_limit = instance.cpu_limit_percent,
         disk_limit = instance.disk_limit_mb,
         id = instance.id,
         csrf = escape(csrf),
         memory_kb = memory_kb,
-        cpu_seconds = cpu_seconds,
+        cpu_percent = cpu_percent,
         disk_kb = disk_kb,
         memory_limit_mb = instance.memory_limit_mb,
         disk_limit_mb = instance.disk_limit_mb,
@@ -484,6 +526,18 @@ pub fn instance_page(
                 r#"<tr><th>Owner</th><td><a href="/admin/users/{owner_id}">{}</a></td></tr>"#,
                 escape(&instance.owner_username),
                 owner_id = instance.owner_id
+            )
+        } else {
+            String::new()
+        },
+        site_card = if instance.preset.is_editable() {
+            format!(
+                r#"<div class="card">
+  <h2 style="margin-top:0">Your site</h2>
+  <p class="muted">Write the html, the css and the javascript of your site.</p>
+  <div class="actions"><a class="btn primary" href="/instances/{id}/site">Open the editor</a></div>
+</div>"#,
+                id = instance.id,
             )
         } else {
             String::new()
@@ -511,6 +565,158 @@ pub fn instance_page(
     layout(&instance.name, Some(user), csrf, &content)
 }
 
+/// The script that keeps the usage of the instances up to date.
+///
+/// The panel is asked for the usage every couple of seconds, so the numbers
+/// on the page are the ones of right now.
+fn live_script() -> String {
+    r#"<script>
+(function () {
+  var rows = document.querySelectorAll('[data-instance]');
+  if (!rows.length) return;
+  function refresh() {
+    fetch('/api/usage', {credentials: 'same-origin'})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        data.forEach(function (item) {
+          var row = document.querySelector('[data-instance="' + item.id + '"]');
+          if (!row) return;
+          var memory = row.querySelector('.usage-memory');
+          var cpu = row.querySelector('.usage-cpu');
+          if (memory) memory.textContent = item.memory_kb + ' KB';
+          if (cpu) cpu.textContent = item.cpu_percent + ' %';
+        });
+      })
+      .catch(function () {});
+  }
+  setInterval(refresh, 2000);
+})();
+</script>"#
+        .to_string()
+}
+
+/// The editor of the files of a site.
+///
+/// The user of the instance writes the html, the style and the script of
+/// their site here.
+pub fn site_editor_page(
+    user: &User,
+    instance: &Instance,
+    csrf: &str,
+    files: &[(String, String)],
+    error: Option<&str>,
+    saved: bool,
+) -> String {
+    let notice = match (error, saved) {
+        (Some(message), _) => format!(r#"<div class="notice error">{}</div>"#, escape(message)),
+        (None, true) => r#"<div class="notice">The site was saved.</div>"#.to_string(),
+        (None, false) => String::new(),
+    };
+
+    let mut forms = String::new();
+    for (name, content) in files {
+        forms.push_str(&format!(
+            r#"<div class="card">
+  <h2 style="margin-top:0">{name}</h2>
+  <form method="post" action="/instances/{id}/site">
+    <input type="hidden" name="_csrf" value="{csrf}">
+    <input type="hidden" name="file" value="{name}">
+    <textarea name="content" rows="16" spellcheck="false" class="editor">{content}</textarea>
+    <div class="actions"><button class="primary" type="submit">Save {name}</button></div>
+  </form>
+</div>"#,
+            name = escape(name),
+            id = instance.id,
+            csrf = escape(csrf),
+            content = escape(content),
+        ));
+    }
+
+    let content = format!(
+        r#"<h1>Site of {name}</h1>
+<p class="sub">Write your own html, css and javascript here. The files are served
+by the instance on <span class="mono">{url}</span>.</p>
+{notice}
+{forms}
+<div class="card">
+  <div class="actions"><a class="btn" href="/instances/{id}">Back to the instance</a></div>
+</div>"#,
+        name = escape(&instance.name),
+        url = escape(&instance.url()),
+        notice = notice,
+        forms = forms,
+        id = instance.id,
+    );
+
+    layout(&instance.name, Some(user), csrf, &content)
+}
+
+/// The page of an administrator with every instance of the machine.
+///
+/// It shows who each instance belongs to, what it runs, and what it uses.
+pub fn admin_instances_page(
+    admin: &User,
+    csrf: &str,
+    instances: &[Instance],
+    usage: &[Usage],
+) -> String {
+    let mut rows = String::new();
+    for (index, instance) in instances.iter().enumerate() {
+        let usage = usage.get(index).cloned().unwrap_or_default();
+        rows.push_str(&format!(
+            r#"<tr data-instance="{id}">
+  <td><a href="/instances/{id}">{name}</a></td>
+  <td>{preset}</td>
+  <td><a href="/admin/users/{owner_id}">{owner}</a></td>
+  <td><span class="badge {state}">{label}</span></td>
+  <td class="mono">{port}</td>
+  <td class="mono usage-memory">{memory} KB</td>
+  <td class="mono usage-cpu">{cpu} %</td>
+  <td class="mono">{memory_limit} MB</td>
+  <td class="mono">{cpu_limit} %</td>
+</tr>"#,
+            id = instance.id,
+            name = escape(&instance.name),
+            preset = escape(instance.preset.label()),
+            owner_id = instance.owner_id,
+            owner = escape(&instance.owner_username),
+            state = instance.state.as_db(),
+            label = instance.state.label(),
+            port = instance.port,
+            memory = usage.memory_kb,
+            cpu = usage.cpu_percent,
+            memory_limit = instance.memory_limit_mb,
+            cpu_limit = instance.cpu_limit_percent,
+        ));
+    }
+
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="9" class="muted">There are no instances yet.</td></tr>"#
+            .to_string();
+    }
+
+    let content = format!(
+        r#"<h1>Instances</h1>
+<p class="sub">Every instance of the machine, and what it is using right now.</p>
+<div class="card">
+  <table>
+    <tr><th>Name</th><th>Preset</th><th>Owner</th><th>State</th><th>Port</th>
+        <th>Memory</th><th>CPU</th><th>Memory limit</th><th>CPU limit</th></tr>
+    {rows}
+  </table>
+</div>
+<div class="card">
+  <div class="actions"><a class="btn" href="/admin">Back to the overview</a></div>
+</div>
+{live}"#,
+        rows = rows,
+        live = live_script(),
+    );
+
+    layout("Instances", Some(admin), csrf, &content)
+}
+
 /// The admin overview.
 pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instance]) -> String {
     let mut rows = String::new();
@@ -521,7 +727,7 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
   <td><span class="badge {role}">{role}</span></td>
   <td>{email}</td>
   <td>{memory} MB</td>
-  <td>{cpu} s</td>
+  <td>{cpu} %</td>
   <td>{disk} MB</td>
   <td>{instances} / {max}</td>
   <td>{state}</td>
@@ -531,7 +737,7 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
             role = user.role.as_db(),
             email = escape(&user.email),
             memory = user.memory_limit_mb,
-            cpu = user.cpu_limit_seconds,
+            cpu = user.cpu_limit_percent,
             disk = user.disk_limit_mb,
             instances = user.instance_limit,
             max = user.instance_limit,
@@ -551,7 +757,7 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
   <td><a href="/admin/users/{owner_id}">{owner}</a></td>
   <td>{port}</td>
   <td>{memory} MB</td>
-  <td>{cpu} s</td>
+  <td>{cpu} %</td>
   <td>{disk} MB</td>
   <td><span class="badge {state}">{label}</span></td>
   <td>
@@ -569,7 +775,7 @@ pub fn admin_page(admin: &User, csrf: &str, users: &[User], instances: &[Instanc
             owner = escape(&instance.owner_username),
             port = instance.port,
             memory = instance.memory_limit_mb,
-            cpu = instance.cpu_limit_seconds,
+            cpu = instance.cpu_limit_percent,
             disk = instance.disk_limit_mb,
             state = instance.state.as_db(),
             label = instance.state.label(),
@@ -637,7 +843,7 @@ pub fn admin_user_page(
             state = instance.state.as_db(),
             label = instance.state.label(),
             memory = instance.memory_limit_mb,
-            cpu = instance.cpu_limit_seconds,
+            cpu = instance.cpu_limit_percent,
         ));
     }
 
@@ -677,8 +883,8 @@ pub fn admin_user_page(
     <div class="row">
       <div class="field" style="flex:1"><label>Memory (MB)</label>
         <input name="memory" type="number" min="16" value="{memory}"></div>
-      <div class="field" style="flex:1"><label>CPU time (s)</label>
-        <input name="cpu" type="number" min="1" value="{cpu}"></div>
+      <div class="field" style="flex:1"><label>CPU (%)</label>
+        <input name="cpu" type="number" min="1" max="800" value="{cpu}"></div>
       <div class="field" style="flex:1"><label>Disk (MB)</label>
         <input name="disk" type="number" min="16" value="{disk}"></div>
       <div class="field" style="flex:1"><label>Instances</label>
@@ -712,7 +918,7 @@ pub fn admin_user_page(
             "Enable account"
         },
         memory = user.memory_limit_mb,
-        cpu = user.cpu_limit_seconds,
+        cpu = user.cpu_limit_percent,
         disk = user.disk_limit_mb,
         max = user.instance_limit,
         rows = rows,
@@ -762,7 +968,7 @@ mod tests {
             is_active: true,
             created_at: 0,
             memory_limit_mb: 256,
-            cpu_limit_seconds: 60,
+            cpu_limit_percent: 50,
             disk_limit_mb: 1024,
             instance_limit: 5,
         }
@@ -778,7 +984,7 @@ mod tests {
             state: InstanceState::Running,
             pid: Some(42),
             memory_limit_mb: 128,
-            cpu_limit_seconds: 30,
+            cpu_limit_percent: 50,
             disk_limit_mb: 512,
             created_at: 0,
             exit_code: None,
@@ -788,9 +994,11 @@ mod tests {
 
     #[test]
     fn pages_escape_user_supplied_names() {
-        let html = dashboard_page(&user(), "csrf", &[], 0, 0, 0);
-        assert!(html.contains("alice"));
-        assert!(!html.contains("<script"));
+        let mut tricky = user();
+        tricky.username = "<script>alert(1)</script>".into();
+        let html = dashboard_page(&tricky, "csrf", &[], &[], 0, 0, 0);
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;script&gt;"));
 
         let html = instance_page(&user(), &instance(), "csrf", 0, 0, 0, false, &[]);
         assert!(html.contains("8100"));
@@ -798,7 +1006,7 @@ mod tests {
 
     #[test]
     fn layout_marks_the_current_user() {
-        let html = dashboard_page(&user(), "csrf", &[], 0, 0, 0);
+        let html = dashboard_page(&user(), "csrf", &[], &[], 0, 0, 0);
         assert!(html.contains("Signed in as"));
         assert!(html.contains("alice"));
     }
@@ -807,7 +1015,7 @@ mod tests {
     fn admin_links_only_appear_for_admins() {
         let mut admin = user();
         admin.role = Role::Admin;
-        let html = dashboard_page(&admin, "csrf", &[], 0, 0, 0);
+        let html = dashboard_page(&admin, "csrf", &[], &[], 0, 0, 0);
         assert!(html.contains(r#"href="/admin""#));
     }
 }

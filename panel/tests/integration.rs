@@ -906,6 +906,329 @@ fn an_instance_needs_a_known_preset() {
     assert!(refused.body.contains("choose a preset"));
 }
 
+/// The user of an instance can write the site of it, and the instance
+/// serves what was written.
+#[test]
+fn a_user_can_write_the_site_of_an_instance() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-site", "site");
+
+    // The editor of the site is there, with the files of a new site.
+    let page = client.get(&format!("/instances/{id}/site"));
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("index.html"));
+    assert!(page.body.contains("style.css"));
+    assert!(page.body.contains("app.js"));
+
+    // The user writes the page of the site.
+    let csrf = extract_csrf(&page.body);
+    let saved = client.post(
+        &format!("/instances/{id}/site"),
+        &format!("_csrf={csrf}&file=index.html&content=<h1>my own page</h1>",),
+    );
+    assert_eq!(saved.status, 200);
+    assert!(saved.body.contains("The site was saved"));
+
+    // The instance serves the file that was written.
+    let page = client.get(&format!("/instances/{id}"));
+    let port = extract_port(&page.body);
+    let csrf = extract_csrf(&page.body);
+    client.post(&format!("/instances/{id}/start"), &format!("_csrf={csrf}"));
+
+    let body = http_get(port, "/");
+    assert!(body.contains("my own page"), "the site should be served");
+}
+
+#[test]
+fn a_user_cannot_write_the_site_of_somebody_else() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut alice = signed_in_client(&panel, "alice");
+    let mut bob = signed_in_client(&panel, "bob");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-site", "site");
+
+    // Bob may not open the editor of the site of Alice.
+    let page = bob.get(&format!("/instances/{id}/site"));
+    assert_eq!(page.status, 403);
+
+    // Nor may he write it.
+    let csrf = bob.csrf("/dashboard");
+    let saved = bob.post(
+        &format!("/instances/{id}/site"),
+        &format!("_csrf={csrf}&file=index.html&content=<h1>mine now</h1>"),
+    );
+    assert_eq!(saved.status, 403);
+
+    // The file of Alice still holds her own text.
+    let page = alice.get(&format!("/instances/{id}/site"));
+    assert!(page.body.contains("Hello, this is my site"));
+}
+
+#[test]
+fn a_file_that_is_not_part_of_the_site_is_refused() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-site", "site");
+
+    let page = client.get(&format!("/instances/{id}/site"));
+    let csrf = extract_csrf(&page.body);
+    let saved = client.post(
+        &format!("/instances/{id}/site"),
+        &format!("_csrf={csrf}&file=evil.sh&content=rm -rf /"),
+    );
+    assert_eq!(saved.status, 200);
+    assert!(saved.body.contains("not part of the site"));
+}
+
+#[test]
+fn the_benchmarker_does_not_run_a_site() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-bench", "benchmarker");
+
+    let page = client.get(&format!("/instances/{id}/site"));
+    assert_eq!(page.status, 403);
+}
+
+#[test]
+fn only_an_administrator_sees_the_page_with_every_instance() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-web", "hello-world");
+
+    // The administrator sees every instance of the machine.
+    let page = admin.get("/instances");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("my-web"));
+    assert!(page.body.contains("alice"));
+
+    // A normal user does not.
+    let page = client.get("/instances");
+    assert_eq!(page.status, 403);
+    let _ = id;
+}
+
+#[test]
+fn the_dashboard_shows_the_usage_of_the_instances() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    create_instance(&mut admin, &owner, "my-web", "hello-world");
+
+    // The dashboard holds the numbers of the instance and the script that
+    // keeps them up to date.
+    let page = client.get("/dashboard");
+    assert!(page.body.contains("usage-memory"));
+    assert!(page.body.contains("usage-cpu"));
+    assert!(page.body.contains("/api/usage"));
+
+    // The api answers with the usage of the instances.
+    let answer = client.get("/api/usage");
+    assert_eq!(answer.status, 200);
+    assert!(answer.body.contains("\"memory_kb\""));
+    assert!(answer.body.contains("\"cpu_percent\""));
+}
+
+#[test]
+fn the_usage_of_an_instance_is_not_shown_to_other_users() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut alice = signed_in_client(&panel, "alice");
+    let mut bob = signed_in_client(&panel, "bob");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    create_instance(&mut admin, &owner, "my-web", "hello-world");
+
+    // The api of Bob holds none of the instances of Alice.
+    let answer = bob.get("/api/usage");
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body.trim(), "[]");
+
+    // The api of Alice holds hers.
+    let answer = alice.get("/api/usage");
+    assert!(answer.body.contains("\"memory_kb\""));
+}
+
+/// The process id of a running instance.
+fn extract_pid(html: &str) -> i32 {
+    let marker = "Process id</th><td class=\"mono\">";
+    let start = html.find(marker).expect("no process id on the page") + marker.len();
+    let end = html[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .expect("unterminated process id")
+        + start;
+    html[start..end]
+        .parse()
+        .expect("process id is not a number")
+}
+
+/// The processor time a process has used, in seconds.
+fn cpu_seconds(pid: i32) -> f64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0.0;
+    };
+    let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime = fields
+        .get(11)
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let stime = fields
+        .get(12)
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    (utime + stime) / 100.0
+}
+
+/// The memory of the benchmarker stays high, so the dashboard shows it.
+///
+/// The point of the benchmarker is that the use of the instance can be seen
+/// while it is high.
+#[test]
+fn the_memory_of_the_benchmarker_stays_high() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-bench", "benchmarker");
+
+    let page = client.get(&format!("/instances/{id}"));
+    let csrf = extract_csrf(&page.body);
+    let started = client.post(&format!("/instances/{id}/start"), &format!("_csrf={csrf}"));
+    assert_eq!(started.status, 303);
+
+    let page = client.get(&format!("/instances/{id}"));
+    let port = extract_port(&page.body);
+
+    // The benchmarker takes as much memory as it may.
+    let body = http_get(port, "/stress/memory");
+    assert!(body.contains("holds"), "{body}");
+
+    // The memory is still there a moment later, and the panel shows it.
+    std::thread::sleep(Duration::from_secs(1));
+    let answer = client.get("/api/usage");
+    let memory = answer
+        .body
+        .split("\"memory_kb\":")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        memory > 8 * 1024,
+        "the instance should hold on to its memory, but it holds {memory} KB"
+    );
+}
+
+/// An instance may not be given more than one core, and an account may not
+/// be given more than the machine has.
+#[test]
+fn the_processor_limits_are_checked() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let _ = signed_in_client(&panel, "alice");
+
+    let page = admin.get("/instances/new");
+    let csrf = extract_csrf(&page.body);
+    let owner = extract_owner(&page.body, "alice");
+
+    // An instance of more than a hundred percent is refused.
+    let refused = admin.post(
+        "/instances/new",
+        &format!(
+            "_csrf={csrf}&name=my-web&owner={owner}&preset=hello-world&memory=64&cpu=150&disk=64"
+        ),
+    );
+    assert_eq!(refused.status, 200);
+    assert!(refused.body.contains("at most one core"));
+
+    // An account of more than the machine has is refused.
+    let page = admin.get("/admin/users/2");
+    let csrf = extract_csrf(&page.body);
+    let refused = admin.post(
+        "/admin/users/2/limits",
+        &format!("_csrf={csrf}&memory=1024&cpu=5000&disk=4096&instances=9"),
+    );
+    assert_eq!(refused.status, 200);
+    assert!(refused.body.contains("more processor than the machine has"));
+
+    // A share of two hundred percent is fine for an account, because it may
+    // hold two instances of a hundred percent.
+    let page = admin.get("/admin/users/2");
+    let csrf = extract_csrf(&page.body);
+    let saved = admin.post(
+        "/admin/users/2/limits",
+        &format!("_csrf={csrf}&memory=1024&cpu=200&disk=4096&instances=9"),
+    );
+    assert_eq!(saved.status, 200);
+    assert!(saved.body.contains("The limits were saved"));
+}
+
+/// The instance is kept inside its share of the processor.
+///
+/// The benchmarker uses as much processor time as it can, and the panel
+/// holds it back to the share it was given.
+#[test]
+fn an_instance_is_kept_inside_its_share_of_the_processor() {
+    let panel = start_panel();
+    let mut admin = admin_client(&panel);
+    let mut client = signed_in_client(&panel, "alice");
+
+    let owner = extract_owner(&admin.get("/instances/new").body, "alice");
+    let id = create_instance(&mut admin, &owner, "my-bench", "benchmarker");
+
+    let page = client.get(&format!("/instances/{id}"));
+    let csrf = extract_csrf(&page.body);
+    let started = client.post(&format!("/instances/{id}/start"), &format!("_csrf={csrf}"));
+    assert_eq!(started.status, 303);
+
+    let page = client.get(&format!("/instances/{id}"));
+    let port = extract_port(&page.body);
+    let pid = extract_pid(&page.body);
+
+    // The benchmarker uses the processor as much as it can.
+    let body = http_get(port, "/stress/cpu");
+    assert!(body.contains("processor is now busy"), "{body}");
+
+    // The panel holds it back to the share of twenty percent.
+    std::thread::sleep(Duration::from_millis(500));
+    let first = cpu_seconds(pid);
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(4));
+    let second = cpu_seconds(pid);
+    let wall = start.elapsed().as_secs_f64();
+
+    let share = (second - first) / wall * 100.0;
+    assert!(
+        share < 50.0,
+        "the instance used {share:.1}% of a core, but it was given twenty percent"
+    );
+
+    // The panel shows the share it holds the instance to.
+    let answer = client.get("/api/usage");
+    assert!(answer.body.contains("\"cpu_percent\""));
+}
+
 /// Ask a server on a port for a page.
 fn http_get(port: u16, path: &str) -> String {
     let mut stream = TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))

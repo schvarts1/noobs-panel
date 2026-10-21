@@ -59,8 +59,8 @@ pub struct User {
     pub created_at: i64,
     /// Total memory quota in megabytes across all owned instances.
     pub memory_limit_mb: i64,
-    /// Total cpu time quota in seconds across all owned instances.
-    pub cpu_limit_seconds: i64,
+    /// Total share of the processor across all owned instances, in percent.
+    pub cpu_limit_percent: i64,
     /// Total disk quota in megabytes across all owned instances.
     pub disk_limit_mb: i64,
     /// Maximum number of instances the account may own.
@@ -144,8 +144,8 @@ pub struct Instance {
     pub pid: Option<i32>,
     /// Memory limit in megabytes.
     pub memory_limit_mb: i64,
-    /// Cpu time limit in seconds.
-    pub cpu_limit_seconds: i64,
+    /// Share of the processor the account may use, in percent.
+    pub cpu_limit_percent: i64,
     /// Disk limit in megabytes.
     pub disk_limit_mb: i64,
     /// Creation timestamp, seconds since the epoch.
@@ -173,8 +173,8 @@ impl Instance {
 pub struct Usage {
     /// Resident memory in kilobytes.
     pub memory_kb: u64,
-    /// Cpu time consumed in seconds.
-    pub cpu_seconds: u64,
+    /// Share of the processor in use, in percent.
+    pub cpu_percent: u64,
     /// Disk space used by the instance in kilobytes.
     pub disk_kb: u64,
 }
@@ -184,8 +184,8 @@ pub struct Usage {
 pub struct Limits {
     /// Memory in megabytes.
     pub memory_mb: i64,
-    /// Cpu time in seconds.
-    pub cpu_seconds: i64,
+    /// Share of the processor, in percent.
+    pub cpu_percent: i64,
     /// Disk space in megabytes.
     pub disk_mb: i64,
 }
@@ -194,7 +194,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             memory_mb: 256,
-            cpu_seconds: 60,
+            cpu_percent: 200,
             disk_mb: 1024,
         }
     }
@@ -235,7 +235,7 @@ mod tests {
             state: InstanceState::Running,
             pid: Some(42),
             memory_limit_mb: 128,
-            cpu_limit_seconds: 30,
+            cpu_limit_percent: 50,
             disk_limit_mb: 512,
             created_at: 0,
             exit_code: None,

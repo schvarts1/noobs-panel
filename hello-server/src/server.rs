@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 use crate::port::BoundPort;
+use crate::site;
 
 /// The body served for the hello world page.
 const HELLO_BODY: &str = "<!DOCTYPE html>
@@ -64,6 +65,17 @@ pub fn serve(
     bound: BoundPort,
     host: IpAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    serve_with_root(bound, host, None)
+}
+
+/// Run the server until the process is stopped, serving the files of a site.
+///
+/// When no directory is given, the built in hello world page is served.
+pub fn serve_with_root(
+    bound: BoundPort,
+    host: IpAddr,
+    root: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let BoundPort {
         listener,
         port,
@@ -88,10 +100,15 @@ pub fn serve(
         let path = request.url().to_string();
         let method = request.method().clone();
 
-        let response: HtmlResponse = if path == "/" || path == "/index.html" {
-            hello_response(port)
+        // A file of the site is served when there is one.
+        let served = root.as_ref().and_then(|root| site::serve_file(root, &path));
+
+        let response: HtmlResponse = if let Some(response) = served {
+            response
         } else if path == "/health" {
             Response::from_string("ok\n")
+        } else if path == "/" || path == "/index.html" {
+            hello_response(port)
         } else {
             Response::from_string("404 Not Found\n").with_status_code(StatusCode(404))
         };

@@ -7,8 +7,9 @@ use crate::auth::{self, SESSION_COOKIE};
 use crate::config::Config;
 use crate::db::Database;
 use crate::instances::InstanceManager;
-use crate::models::{Instance, Role, User};
+use crate::models::{Instance, Role, Usage, User};
 use crate::presets::Preset;
+use crate::site;
 use crate::views;
 use crate::web::{self, WebRequest};
 
@@ -24,6 +25,15 @@ pub struct App {
 
 /// The result of handling a request.
 pub type Response = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
+
+/// The share of one core an instance may use at most, in percent.
+const MAX_INSTANCE_CPU_PERCENT: i64 = 100;
+
+/// The share of the processor an account may hold at most, in percent.
+///
+/// An account may hold more than a whole processor, because it may have
+/// more than one instance.
+const MAX_ACCOUNT_CPU_PERCENT: i64 = 800;
 
 /// The current time in seconds since the epoch.
 pub fn now() -> i64 {
@@ -54,9 +64,13 @@ pub fn handle(app: &App, request: &WebRequest) -> Response {
         ("POST", ["signup"]) => signup_submit(app, request),
         ("POST", ["logout"]) => logout(app, request),
         ("GET", ["dashboard"]) => dashboard(app, request),
+        ("GET", ["api", "usage"]) => api_usage(app, request),
+        ("GET", ["instances"]) => admin_instances(app, request),
         ("GET", ["instances", "new"]) => new_instance_page(app, request),
         ("POST", ["instances", "new"]) => create_instance(app, request),
         ("POST", ["instances", id, "owner"]) => assign_instance(app, request, id),
+        ("GET", ["instances", id, "site"]) => site_editor(app, request, id),
+        ("POST", ["instances", id, "site"]) => site_save(app, request, id),
         ("GET", ["instances", id]) => instance_detail(app, request, id),
         ("POST", ["instances", id, "start"]) => start_instance(app, request, id),
         ("POST", ["instances", id, "stop"]) => stop_instance(app, request, id),
@@ -168,6 +182,38 @@ fn check_form_csrf(app: &App, request: &WebRequest) -> bool {
         return false;
     }
     app.db.csrf_token_is_valid(expected, now()).unwrap_or(false)
+}
+
+/// The live usage of the instances of the caller, as json.
+///
+/// The dashboard asks for this every couple of seconds, so the numbers on
+/// the page are the ones of right now.
+fn api_usage(app: &App, request: &WebRequest) -> Response {
+    let identity = match require_identity(app, request) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    // An administrator sees the usage of every instance, a normal user only
+    // the ones that belong to them.
+    let instances = if identity.user.is_admin() {
+        app.db.list_instances(None).unwrap_or_default()
+    } else {
+        app.db
+            .list_instances(Some(identity.user.id))
+            .unwrap_or_default()
+    };
+
+    let mut items = Vec::new();
+    for instance in &instances {
+        let usage = app.manager.usage(instance);
+        items.push(format!(
+            "{{\"id\":{},\"memory_kb\":{},\"cpu_percent\":{}}}",
+            instance.id, usage.memory_kb, usage.cpu_percent
+        ));
+    }
+
+    web::json(200, format!("[{}]", items.join(",")))
 }
 
 /// The page with the sign in form.
@@ -384,12 +430,19 @@ fn dashboard(app: &App, request: &WebRequest) -> Response {
         .unwrap_or_default();
     let (memory, cpu, disk) = used_resources(app, &instances);
 
+    // What the instances are using right now.
+    let usage: Vec<Usage> = instances
+        .iter()
+        .map(|instance| app.manager.usage(instance))
+        .collect();
+
     web::html(
         200,
         views::dashboard_page(
             &identity.user,
             &identity.csrf,
             &instances,
+            &usage,
             memory,
             cpu,
             disk,
@@ -404,7 +457,7 @@ fn used_resources(app: &App, instances: &[Instance]) -> (i64, i64, i64) {
     let mut disk = 0;
     for instance in instances {
         memory += instance.memory_limit_mb;
-        cpu += instance.cpu_limit_seconds;
+        cpu += instance.cpu_limit_percent;
         disk += instance.disk_limit_mb;
         let _ = app;
     }
@@ -469,6 +522,15 @@ fn create_instance(app: &App, request: &WebRequest) -> Response {
     if memory < 16 || cpu < 1 || disk < 16 {
         return render_new_instance(app, &identity, Some("Those resource limits are too small."));
     }
+    // An instance uses at most one core, so it may not be given more than a
+    // hundred percent.
+    if cpu > MAX_INSTANCE_CPU_PERCENT {
+        return render_new_instance(
+            app,
+            &identity,
+            Some("An instance may use at most one core."),
+        );
+    }
 
     // The instance belongs to the account the administrator picks, and that
     // account has to have room for it.
@@ -518,6 +580,17 @@ fn create_instance(app: &App, request: &WebRequest) -> Response {
         }
     };
 
+    // A site starts with the files the user can change.
+    if preset.starts_with_files() {
+        if let Err(err) = site::seed(&app.config.data_dir, id) {
+            return render_new_instance(
+                app,
+                &identity,
+                Some(&format!("Cannot create the files of the site: {err}")),
+            );
+        }
+    }
+
     // The page of the new instance is more useful than the dashboard,
     // because the instance belongs to somebody else.
     web::redirect(&format!("/instances/{id}"))
@@ -561,7 +634,7 @@ fn quota_allows(
 
     let (used_memory, used_cpu, used_disk) = used_resources(app, &instances);
     if used_memory + memory > owner.memory_limit_mb
-        || used_cpu + cpu > owner.cpu_limit_seconds
+        || used_cpu + cpu > owner.cpu_limit_percent
         || used_disk + disk > owner.disk_limit_mb
     {
         return Err("That account does not have enough resources left for this instance.".into());
@@ -600,7 +673,7 @@ fn assign_instance(app: &App, request: &WebRequest, id: &str) -> Response {
         app,
         &owner,
         instance.memory_limit_mb,
-        instance.cpu_limit_seconds,
+        instance.cpu_limit_percent,
         instance.disk_limit_mb,
         Some(instance.id),
     ) {
@@ -682,11 +755,148 @@ fn instance_detail(app: &App, request: &WebRequest, id: &str) -> Response {
             &instance,
             &identity.csrf,
             usage.memory_kb,
-            usage.cpu_seconds,
+            usage.cpu_percent,
             disk,
             identity.user.is_admin(),
             &users,
         ),
+    )
+}
+
+/// The editor of the site of an instance.
+fn site_editor(app: &App, request: &WebRequest, id: &str) -> Response {
+    let identity = match require_identity(app, request) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    let id: i64 = match id.parse() {
+        Ok(id) => id,
+        Err(_) => return not_found(app, request),
+    };
+    let instance = match app.db.instance_by_id(id) {
+        Ok(Some(instance)) => instance,
+        _ => return not_found(app, request),
+    };
+
+    // A user may only change their own instances, unless they are an
+    // administrator.
+    if instance.owner_id != identity.user.id && !identity.user.is_admin() {
+        return web::html(
+            403,
+            views::error_page(
+                Some(&identity.user),
+                &identity.csrf,
+                403,
+                "That instance does not belong to you.",
+            ),
+        );
+    }
+
+    if !instance.preset.is_editable() {
+        return web::html(
+            403,
+            views::error_page(
+                Some(&identity.user),
+                &identity.csrf,
+                403,
+                "This instance does not run a site.",
+            ),
+        );
+    }
+
+    let files = site::read_all(&app.config.data_dir, instance.id);
+    web::html(
+        200,
+        views::site_editor_page(
+            &identity.user,
+            &instance,
+            &identity.csrf,
+            &files,
+            None,
+            false,
+        ),
+    )
+}
+
+/// Save one file of the site of an instance.
+fn site_save(app: &App, request: &WebRequest, id: &str) -> Response {
+    let identity = match require_identity(app, request) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if let Err(response) = check_csrf(&identity, request) {
+        return response;
+    }
+
+    let id: i64 = match id.parse() {
+        Ok(id) => id,
+        Err(_) => return not_found(app, request),
+    };
+    let instance = match app.db.instance_by_id(id) {
+        Ok(Some(instance)) => instance,
+        _ => return not_found(app, request),
+    };
+
+    if instance.owner_id != identity.user.id && !identity.user.is_admin() {
+        return web::html(
+            403,
+            views::error_page(
+                Some(&identity.user),
+                &identity.csrf,
+                403,
+                "That instance does not belong to you.",
+            ),
+        );
+    }
+
+    if !instance.preset.is_editable() {
+        return web::html(
+            403,
+            views::error_page(
+                Some(&identity.user),
+                &identity.csrf,
+                403,
+                "This instance does not run a site.",
+            ),
+        );
+    }
+
+    let name = request.trimmed_field("file");
+    let content = request.field("content").unwrap_or_default().to_string();
+
+    let error = site::write(&app.config.data_dir, instance.id, &name, &content).err();
+
+    let files = site::read_all(&app.config.data_dir, instance.id);
+    web::html(
+        200,
+        views::site_editor_page(
+            &identity.user,
+            &instance,
+            &identity.csrf,
+            &files,
+            error.as_deref(),
+            error.is_none(),
+        ),
+    )
+}
+
+/// The page of an administrator with every instance of the machine.
+fn admin_instances(app: &App, request: &WebRequest) -> Response {
+    let identity = match require_admin(app, request) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    let instances = app.db.list_instances(None).unwrap_or_default();
+    let usage: Vec<Usage> = instances
+        .iter()
+        .map(|instance| app.manager.usage(instance))
+        .collect();
+
+    web::html(
+        200,
+        views::admin_instances_page(&identity.user, &identity.csrf, &instances, &usage),
     )
 }
 
@@ -924,6 +1134,16 @@ fn admin_set_limits(app: &App, request: &WebRequest, id: &str) -> Response {
     if memory < 16 || cpu < 1 || disk < 16 || max_instances < 0 {
         return render_admin_user(app, &identity, &user, "Those limits are not valid.");
     }
+    // An account may hold more than a whole processor, because it may have
+    // more than one instance, but not more than the machine has cores.
+    if cpu > MAX_ACCOUNT_CPU_PERCENT {
+        return render_admin_user(
+            app,
+            &identity,
+            &user,
+            "That is more processor than the machine has.",
+        );
+    }
 
     let _ = app.db.set_limits(user.id, memory, cpu, disk, max_instances);
     render_admin_user(app, &identity, &user, "The limits were saved.")
@@ -1014,7 +1234,7 @@ fn render_instance_error(
         instance,
         &identity.csrf,
         usage.memory_kb,
-        usage.cpu_seconds,
+        usage.cpu_percent,
         disk,
         identity.user.is_admin(),
         &users,
